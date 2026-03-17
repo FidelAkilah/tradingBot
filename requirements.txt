@@ -1,0 +1,11 @@
+# Core
+ccxt>=4.0.0          # Unified exchange API (includes ccxt.pro for WebSocket)
+numpy>=1.24.0        # Fast numerical computation for order book analysis
+
+# Server
+fastapi>=0.110.0     # REST API framework
+uvicorn[standard]>=0.27.0  # ASGI server
+
+# Optional — for enhanced logging and analysis
+aiofiles>=23.0       # Async file I/O for log writing
+rich>=13.0           # Pretty terminal output (optional)

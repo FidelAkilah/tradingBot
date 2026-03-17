@@ -1,0 +1,14 @@
+# Secrets — NEVER commit these
+.env
+*.key
+
+# Logs
+*.log
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: crypto-swing-bot
+    runtime: docker
+    region: singapore   # Close to Binance servers
+    plan: starter       # $7/month — keeps bot running 24/7
+    healthCheckPath: /health
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false     # Set manually in Render dashboard
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: BINANCE_TESTNET
+        value: "false"
+      - key: SHADOW_MODE
+        value: "true"   # Start in shadow mode, switch to "false" when ready
+      - key: ALLOWED_ORIGINS
+        value: "https://your-app.vercel.app"  # Update with your Vercel URL
+      - key: DB_PATH
+        value: "/app/data/bot_data.db"
+    disk:
+      name: bot-data
+      mountPath: /app/data
+      sizeGB: 1         # Persistent disk for SQLite
