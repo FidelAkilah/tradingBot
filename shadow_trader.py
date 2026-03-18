@@ -79,6 +79,13 @@ class ShadowTrader:
         self.closed_trades: List[ShadowTrade] = []
         self.signal_log: List[dict] = []
 
+        # Per-symbol cooldown tracking: symbol -> time of last close
+        self._last_close_time: Dict[str, float] = {}
+        self._symbol_cooldown_s = 60.0  # 60s cooldown after any trade close
+
+        # Latest known price per symbol (for live unrealized P&L)
+        self.last_prices: Dict[str, float] = {}
+
         # Stats
         self.total_pnl = 0.0
         self.wins = 0
@@ -115,8 +122,13 @@ class ShadowTrader:
         if symbol in self.open_trades:
             return None
 
-        # Simulate execution latency
-        entry_time = time.time() + (self.sc.latency_simulation_ms / 1000.0)
+        # Per-symbol cooldown — prevent spam re-entry after close
+        now = time.time()
+        last_close = self._last_close_time.get(symbol, 0)
+        if now - last_close < self._symbol_cooldown_s:
+            return None
+
+        entry_time = now
 
         if analysis.trade_suggestion == "BUY":
             return self._open_buy(analysis, entry_time)
@@ -136,6 +148,7 @@ class ShadowTrader:
 
         wall = walls[0] if walls else None
         tc = self.config.trading
+        fc = self.config.futures
         mid = analysis.mid_price
 
         if wall:
@@ -144,7 +157,10 @@ class ShadowTrader:
         else:
             entry_price = mid  # Enter at mid if no wall (candle-driven entry)
 
-        amount = tc.max_position_usd / entry_price
+        # Position size: margin * leverage = notional, then convert to asset amount
+        leverage = fc.leverage if fc.enabled else 1
+        notional_usd = tc.max_position_usd * leverage
+        amount = notional_usd / entry_price
 
         # Use ATR-based dynamic TP/SL if available, fall back to config
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
@@ -215,6 +231,7 @@ class ShadowTrader:
 
         wall = walls[0] if walls else None
         tc = self.config.trading
+        fc = self.config.futures
         mid = analysis.mid_price
 
         if wall:
@@ -223,7 +240,10 @@ class ShadowTrader:
         else:
             entry_price = mid  # Enter at mid if no wall (candle-driven entry)
 
-        amount = tc.max_position_usd / entry_price
+        # Position size: margin * leverage = notional, then convert to asset amount
+        leverage = fc.leverage if fc.enabled else 1
+        notional_usd = tc.max_position_usd * leverage
+        amount = notional_usd / entry_price
 
         # Use ATR-based dynamic TP/SL if available, fall back to config
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
@@ -294,11 +314,18 @@ class ShadowTrader:
 
         Returns a TradeRecord if a trade was closed, None otherwise.
         """
+        # Always track latest price for unrealized P&L display
+        self.last_prices[symbol] = current_price
+
         if symbol not in self.open_trades:
             return None
 
         trade = self.open_trades[symbol]
         now = time.time()
+
+        # Don't check TP/SL within first 2 seconds — prevents same-tick close
+        if now - trade.entry_time < 2.0:
+            return None
 
         exit_reason = None
         exit_price = current_price
@@ -334,7 +361,10 @@ class ShadowTrader:
         reason: str,
         exit_time: float,
     ) -> TradeRecord:
-        """Close a shadow trade and record results."""
+        """Close a shadow trade and record results.
+
+        P&L already reflects leverage because amount = (margin * leverage) / price.
+        """
         if trade.side == "BUY":
             pnl = (exit_price - trade.entry_price) * trade.amount
         else:
@@ -357,9 +387,10 @@ class ShadowTrader:
         else:
             self.losses += 1
 
-        # Move to closed
+        # Move to closed and record cooldown
         del self.open_trades[trade.symbol]
         self.closed_trades.append(trade)
+        self._last_close_time[trade.symbol] = exit_time
 
         self._log_trade(trade, "CLOSE")
 

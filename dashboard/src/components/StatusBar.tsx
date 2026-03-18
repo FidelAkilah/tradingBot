@@ -6,6 +6,8 @@ import { Activity, Wifi, WifiOff, Zap } from 'lucide-react';
 export function StatusBar() {
   const { data, error } = useStatus();
 
+  // If we have data, the API is reachable — we're connected
+  const apiReachable = !!data;
   const isRunning = data?.status === 'running';
   const isShadow = data?.is_shadow;
 
@@ -38,16 +40,21 @@ export function StatusBar() {
         <span className="text-text-secondary/50">|</span>
 
         <span>{data?.leverage || 30}x</span>
-        <span>{data?.margin_type || 'ISOLATED'}</span>
+        <span>{data?.margin_type || 'CROSSED'}</span>
 
         <span className="text-text-secondary/50">|</span>
 
         <div className="flex items-center gap-1.5">
-          {isRunning ? (
+          {apiReachable && isRunning ? (
             <>
               <div className="w-2 h-2 bg-accent-green rounded-full pulse-dot" />
               <Wifi className="w-3.5 h-3.5 text-accent-green" />
               <span className="text-accent-green">Connected</span>
+            </>
+          ) : apiReachable ? (
+            <>
+              <Activity className="w-3.5 h-3.5 text-accent-yellow" />
+              <span className="text-accent-yellow">{data?.status || 'Starting...'}</span>
             </>
           ) : error ? (
             <>

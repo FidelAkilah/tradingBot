@@ -1,9 +1,10 @@
 """
 FastAPI server — REST API wrapping the trading bot.
-Hosts on Render, provides endpoints for the Vercel frontend dashboard.
+Runs locally, provides endpoints for the localhost dashboard.
 
 Usage:
-    uvicorn server:app --host 0.0.0.0 --port $PORT
+    python server.py                     # Starts API on http://localhost:8000
+    python server.py --port 9000         # Custom port
 """
 
 import asyncio
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 import database as db
 from config import CONFIG, BotConfig, IDR_PER_USD
+from main import load_env_file
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,9 @@ class BotRunner:
 
         self.bot = ScalpingBot(config)
 
+        # Mark as server mode so bot doesn't call loop.stop() on force quit
+        self.bot._server_mode = True
+
         # Hook into shadow trader to persist trades to DB
         if self.bot.shadow:
             self._hook_shadow_trader(self.bot.shadow)
@@ -72,19 +77,27 @@ class BotRunner:
             self.status = "stopped"
 
     async def stop(self):
-        if self.bot and self.status == "running":
+        if self.bot and self.status in ("running", "stopping"):
             self.status = "stopping"
             self.bot._running = False
-            if self.task:
+
+            # Cancel the background task
+            if self.task and not self.task.done():
                 self.task.cancel()
                 try:
-                    await asyncio.wait_for(self.task, timeout=10)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(self.task), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                     pass
+
+            # Explicitly close exchange connection
             try:
-                await self.bot.shutdown()
-            except Exception:
+                if self.bot.stream and self.bot.stream.exchange:
+                    await asyncio.wait_for(self.bot.stream.exchange.close(), timeout=3)
+            except (asyncio.TimeoutError, Exception):
                 pass
+
+            self.bot = None
+            self.task = None
             self.status = "stopped"
 
     def _hook_shadow_trader(self, shadow):
@@ -157,15 +170,18 @@ class BotRunner:
 
         if self.bot and self.bot.risk:
             rs = self.bot.risk.state
+            wins = sum(1 for t in rs.trades_today if t.pnl_usd > 0)
+            losses = sum(1 for t in rs.trades_today if t.pnl_usd <= 0)
+            total_trades = wins + losses
             result.update({
                 "equity_usd": rs.current_equity,
                 "peak_equity_usd": rs.peak_equity,
                 "drawdown_pct": (1 - rs.current_equity / rs.peak_equity) * 100 if rs.peak_equity > 0 else 0,
                 "daily_pnl_usd": rs.daily_pnl,
-                "total_trades": rs.total_trades,
-                "wins": rs.wins,
-                "losses": rs.losses,
-                "win_rate": rs.wins / rs.total_trades * 100 if rs.total_trades > 0 else 0,
+                "total_trades": total_trades,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": wins / total_trades * 100 if total_trades > 0 else 0,
             })
 
         if self.bot and self.bot.shadow:
@@ -196,6 +212,9 @@ def _format_duration(seconds: float) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
+    # Load .env file (local mode)
+    load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
     # Initialize database
     db.init_db()
     logger.info("Database initialized")
@@ -216,15 +235,18 @@ async def lifespan(app: FastAPI):
         shadow = os.environ.get("SHADOW_MODE", "true").lower()
         CONFIG.shadow.enabled = shadow in ("true", "1", "yes")
 
-        logger.info("Auto-starting bot with environment API keys...")
+        logger.info(f"Auto-starting bot (shadow={CONFIG.shadow.enabled}, sandbox={CONFIG.exchange.sandbox})...")
         await bot_runner.start(CONFIG)
     else:
-        logger.warning("No API keys found — bot not auto-started. Set BINANCE_API_KEY and BINANCE_API_SECRET.")
+        logger.warning("No API keys found — bot not auto-started. Create a .env file (see .env.example).")
 
     yield
 
-    # Shutdown
-    await bot_runner.stop()
+    # Shutdown — gracefully stop bot before uvicorn exits
+    try:
+        await bot_runner.stop()
+    except Exception as e:
+        logger.warning(f"Shutdown error (safe to ignore): {e}")
 
 
 app = FastAPI(
@@ -234,12 +256,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow Vercel frontend
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+# CORS — allow all localhost origins for local dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -257,7 +278,7 @@ async def root():
 @app.get("/api/status")
 async def get_status():
     """Bot status, equity, P&L overview."""
-    return bot_runner.get_status()
+    return _sanitize_floats(bot_runner.get_status())
 
 
 @app.get("/api/trades")
@@ -280,20 +301,25 @@ async def get_positions():
     # Also get live data from bot if running
     live_positions = []
     if bot_runner.bot and bot_runner.bot.shadow:
+        from dataclasses import asdict
         for sym, trade in bot_runner.bot.shadow.open_trades.items():
-            from dataclasses import asdict
             td = asdict(trade)
             td["leverage"] = CONFIG.futures.leverage
-            # Calculate live P&L
-            mid = td.get("entry_price", 0)
-            if bot_runner.bot.stream and hasattr(bot_runner.bot.stream, '_last_update'):
-                pass  # Price comes from the trade's current state
+
+            # Compute live unrealized P&L from latest known price
+            current_price = bot_runner.bot.shadow.last_prices.get(sym, trade.entry_price)
+            if trade.side == "BUY":
+                td["pnl_usd"] = (current_price - trade.entry_price) * trade.amount
+            else:
+                td["pnl_usd"] = (trade.entry_price - current_price) * trade.amount
+            td["current_price"] = current_price
+
             live_positions.append(td)
 
-    return {
+    return _sanitize_floats({
         "positions": live_positions if live_positions else open_trades,
         "count": len(live_positions) if live_positions else len(open_trades),
-    }
+    })
 
 
 @app.get("/api/signals")
@@ -304,6 +330,20 @@ async def get_signals(
     """Recent analysis signals."""
     signals = db.get_signals(limit=limit, symbol=symbol)
     return {"signals": signals, "count": len(signals)}
+
+
+def _sanitize_floats(obj):
+    """Replace inf/nan with JSON-safe values."""
+    import math
+    if isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            return 0.0
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    return obj
 
 
 @app.get("/api/performance")
@@ -318,7 +358,7 @@ async def get_performance():
     summary["capital_idr"] = CONFIG.trading.starting_capital_idr
     summary["capital_usd"] = CONFIG.trading.starting_capital_idr / idr_rate
 
-    return summary
+    return _sanitize_floats(summary)
 
 
 @app.get("/api/pnl-chart")
@@ -376,6 +416,17 @@ async def health_check():
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+
+    parser = argparse.ArgumentParser(description="Trading Bot API Server")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
+    args = parser.parse_args()
+
+    print(f"\n  Trading Bot API starting on http://{args.host}:{args.port}")
+    print(f"  Dashboard: http://localhost:3000")
+    print(f"  API docs:  http://{args.host}:{args.port}/docs\n")
+
+    uvicorn.run("server:app", host=args.host, port=args.port, reload=args.reload)

@@ -65,7 +65,7 @@ export function PnlChart() {
                   color: '#e5e7eb',
                   fontSize: '12px',
                 }}
-                formatter={(value: number) => [`$${value.toFixed(4)}`, 'P&L']}
+                formatter={(value: number) => [`$${value.toFixed(2)}`, 'P&L']}
               />
               <ReferenceLine y={0} stroke="#4b5563" strokeDasharray="3 3" />
               <Area

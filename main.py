@@ -149,6 +149,7 @@ class ScalpingBot:
         self._running = False
         self._shutdown_requested = False
         self._force_quit_count = 0
+        self._server_mode = False          # True when running under uvicorn/server.py
         self._analysis_count = 0
         self._print_interval = 20
 
@@ -186,7 +187,10 @@ class ScalpingBot:
             await self._update_swing_signal(symbol)
 
         self.stream.on_order_book(self._on_order_book_update)
-        self._install_signal_handlers()
+
+        # Only install signal handlers when running standalone (not under uvicorn)
+        if not self._server_mode:
+            self._install_signal_handlers()
 
         self._running = True
         await self.stream.start()
@@ -213,9 +217,12 @@ class ScalpingBot:
                     await exchange.set_margin_mode(fc.margin_type.lower(), symbol)
                     logger.info(f"  [{symbol}] Margin type: {fc.margin_type}")
                 except Exception as e:
-                    # "No need to change margin type" is OK
-                    if "No need to change" in str(e) or "already" in str(e).lower():
+                    err_str = str(e)
+                    if "No need to change" in err_str or "already" in err_str.lower():
                         logger.info(f"  [{symbol}] Margin type already {fc.margin_type}")
+                    elif "-4168" in err_str or "Multi-Assets" in err_str:
+                        # Multi-Assets mode doesn't allow margin type changes — that's fine
+                        logger.info(f"  [{symbol}] Multi-Assets mode active, using CROSSED margin")
                     else:
                         logger.warning(f"  [{symbol}] Margin type error: {e}")
 
@@ -242,7 +249,9 @@ class ScalpingBot:
                         task.cancel()
             else:
                 logger.warning("\nForce quit.")
-                loop.stop()
+                # Only stop the loop if we're running standalone (not under uvicorn)
+                if not self._server_mode:
+                    loop.stop()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -279,32 +288,27 @@ class ScalpingBot:
         analysis = self.analyzer.analyze(symbol, order_book, recent_trades, timestamp, swing)
         self._analysis_count += 1
 
-        # Pre-trade risk check
-        can_trade, reason = self.risk.can_trade()
-        if not can_trade:
-            if "halted" in reason.lower():
-                logger.warning(f"Risk blocked: {reason}")
-            return
-
-        if not self.risk.validate_spread(analysis.spread_pct):
-            return
-
         # ── Shadow Mode ──
         if self.is_shadow and self.shadow:
-            trade = self.shadow.process_signal(analysis)
+            # ALWAYS monitor open positions — even when risk is halted.
+            # Price updates, TP/SL, wall-pull, and max-hold checks must run
+            # regardless of whether new entries are allowed.
 
-            # VPIN dynamic stop widening
+            # VPIN dynamic stop widening (one-time, capped at 2x original distance)
             if symbol in self.shadow.open_trades and analysis.vpin.should_widen_stops:
                 st = self.shadow.open_trades[symbol]
-                mult = analysis.vpin.stop_multiplier
-                if st.side == "BUY":
-                    original_stop_dist = st.entry_price - st.stop_price
-                    if original_stop_dist > 0:
-                        st.stop_price = st.entry_price - (original_stop_dist * mult)
-                else:
-                    original_stop_dist = st.stop_price - st.entry_price
-                    if original_stop_dist > 0:
-                        st.stop_price = st.entry_price + (original_stop_dist * mult)
+                if not hasattr(st, '_original_stop_dist') or st._original_stop_dist is None:
+                    if st.side == "BUY":
+                        st._original_stop_dist = st.entry_price - st.stop_price
+                    else:
+                        st._original_stop_dist = st.stop_price - st.entry_price
+
+                if st._original_stop_dist and st._original_stop_dist > 0:
+                    mult = min(analysis.vpin.stop_multiplier, 2.0)
+                    if st.side == "BUY":
+                        st.stop_price = st.entry_price - (st._original_stop_dist * mult)
+                    else:
+                        st.stop_price = st.entry_price + (st._original_stop_dist * mult)
 
             trade_record = self.shadow.update_prices(symbol, analysis.mid_price)
             if trade_record:
@@ -337,23 +341,29 @@ class ScalpingBot:
                         logger.info(f"[{symbol}] Max hold time reached, closing.")
                         self.risk.record_trade(record)
 
+            # Only open new trades if risk allows AND spread is acceptable
+            can_trade, reason = self.risk.can_trade()
+            if can_trade and self.risk.validate_spread(analysis.spread_pct):
+                self.shadow.process_signal(analysis)
+
         # ── Live Mode ──
         else:
             if self.order_manager:
-                equity = self.risk.state.current_equity
-                await self.order_manager.execute_signal(analysis, equity, is_shadow=False)
-
+                # Always monitor existing positions
                 if symbol in self.order_manager.positions and analysis.vpin.should_widen_stops:
                     pos = self.order_manager.positions[symbol]
-                    mult = analysis.vpin.stop_multiplier
-                    if pos.side == PositionSide.LONG:
-                        original_dist = pos.entry_price - pos.stop_loss_price
-                        if original_dist > 0:
-                            pos.stop_loss_price = pos.entry_price - (original_dist * mult)
-                    else:
-                        original_dist = pos.stop_loss_price - pos.entry_price
-                        if original_dist > 0:
-                            pos.stop_loss_price = pos.entry_price + (original_dist * mult)
+                    if not hasattr(pos, '_original_stop_dist') or pos._original_stop_dist is None:
+                        if pos.side == PositionSide.LONG:
+                            pos._original_stop_dist = pos.entry_price - pos.stop_loss_price
+                        else:
+                            pos._original_stop_dist = pos.stop_loss_price - pos.entry_price
+
+                    if hasattr(pos, '_original_stop_dist') and pos._original_stop_dist and pos._original_stop_dist > 0:
+                        mult = min(analysis.vpin.stop_multiplier, 2.0)
+                        if pos.side == PositionSide.LONG:
+                            pos.stop_loss_price = pos.entry_price - (pos._original_stop_dist * mult)
+                        else:
+                            pos.stop_loss_price = pos.entry_price + (pos._original_stop_dist * mult)
 
                 cancelled = await self.order_manager.check_wall_health(analysis, is_shadow=False)
                 action = await self.order_manager.update_positions(
@@ -365,6 +375,12 @@ class ScalpingBot:
                         exit_price=analysis.mid_price, amount=0,
                         pnl_usd=0, reason=action, timestamp=timestamp,
                     ))
+
+                # Only open new trades if risk allows
+                can_trade, reason = self.risk.can_trade()
+                if can_trade and self.risk.validate_spread(analysis.spread_pct):
+                    equity = self.risk.state.current_equity
+                    await self.order_manager.execute_signal(analysis, equity, is_shadow=False)
 
         # Periodic logging
         if self._analysis_count % self._print_interval == 0:

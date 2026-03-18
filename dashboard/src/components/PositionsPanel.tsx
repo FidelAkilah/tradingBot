@@ -26,8 +26,8 @@ export function PositionsPanel() {
           {positions.map((pos: any, i: number) => {
             const isBuy = pos.side === 'BUY';
             const pnl = pos.pnl_usd || 0;
-            const pnlLev = pnl * leverage;
             const isProfit = pnl >= 0;
+            const pnlPct = pos.entry_price ? ((pos.current_price || pos.entry_price) / pos.entry_price - 1) * 100 * (isBuy ? 1 : -1) : 0;
             const holdTime = pos.entry_time ? (Date.now() / 1000 - pos.entry_time) : 0;
             const holdMin = Math.floor(holdTime / 60);
             const holdHr = Math.floor(holdMin / 60);
@@ -54,14 +54,21 @@ export function PositionsPanel() {
                     </span>
                   </div>
                   <span className={`text-sm font-bold ${isProfit ? 'text-accent-green' : 'text-accent-red'}`}>
-                    {isProfit ? '+' : ''}{pnlLev.toFixed(4)} USD
+                    {isProfit ? '+' : ''}{pnl.toFixed(2)} USD
+                    <span className="text-[10px] ml-1 opacity-70">
+                      ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%)
+                    </span>
                   </span>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2 text-xs text-text-secondary">
+                <div className="grid grid-cols-4 gap-2 text-xs text-text-secondary">
                   <div>
                     <span className="text-text-secondary/50">Entry:</span>{' '}
                     <span className="text-text-primary">${pos.entry_price?.toFixed(2)}</span>
+                  </div>
+                  <div>
+                    <span className="text-text-secondary/50">Mark:</span>{' '}
+                    <span className="text-accent-blue">${(pos.current_price || pos.entry_price)?.toFixed(2)}</span>
                   </div>
                   <div>
                     <span className="text-text-secondary/50">TP:</span>{' '}
@@ -74,7 +81,7 @@ export function PositionsPanel() {
                 </div>
 
                 <div className="flex items-center justify-between mt-2 text-[10px] text-text-secondary/60">
-                  <span>Score: {pos.composite_score?.toFixed(3) || 'N/A'}</span>
+                  <span>Margin: ${pos.usd_value?.toFixed(2) || '—'}</span>
                   <span>Trend: {pos.swing_trend || 'N/A'}</span>
                   <span>Hold: {holdHr > 0 ? `${holdHr}h ${holdMin % 60}m` : `${holdMin}m`}</span>
                 </div>

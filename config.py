@@ -25,7 +25,7 @@ class FuturesConfig:
     """Binance Futures settings."""
     enabled: bool = True                        # Use USDT-M Futures
     leverage: int = 30                          # 30x leverage all pairs
-    margin_type: str = "ISOLATED"               # ISOLATED or CROSSED
+    margin_type: str = "CROSSED"                # CROSSED (required for Multi-Assets mode)
     position_mode: str = "one-way"              # one-way or hedge
 
 

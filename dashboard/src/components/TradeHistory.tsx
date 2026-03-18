@@ -28,9 +28,10 @@ export function TradeHistory() {
                 <th className="text-left py-2 px-2 font-bold">Time</th>
                 <th className="text-left py-2 px-2 font-bold">Pair</th>
                 <th className="text-left py-2 px-2 font-bold">Side</th>
+                <th className="text-right py-2 px-2 font-bold">Margin</th>
                 <th className="text-right py-2 px-2 font-bold">Entry</th>
                 <th className="text-right py-2 px-2 font-bold">Exit</th>
-                <th className="text-right py-2 px-2 font-bold">P&L (w/ {leverage}x)</th>
+                <th className="text-right py-2 px-2 font-bold">P&L ({leverage}x)</th>
                 <th className="text-left py-2 px-2 font-bold">Reason</th>
                 <th className="text-left py-2 px-2 font-bold">Trend</th>
                 <th className="text-right py-2 px-2 font-bold">Duration</th>
@@ -40,7 +41,6 @@ export function TradeHistory() {
               {trades.map((trade: any, i: number) => {
                 const isBuy = trade.side === 'BUY';
                 const pnl = trade.pnl_usd || 0;
-                const pnlLev = pnl * leverage;
                 const isProfit = pnl > 0;
                 const duration = trade.duration_s || 0;
                 const durStr = duration > 3600
@@ -75,6 +75,9 @@ export function TradeHistory() {
                         {trade.side}
                       </span>
                     </td>
+                    <td className="py-2 px-2 text-right text-text-secondary">
+                      ${trade.usd_value?.toFixed(2) || '—'}
+                    </td>
                     <td className="py-2 px-2 text-right text-text-primary">
                       ${trade.entry_price?.toFixed(2)}
                     </td>
@@ -85,7 +88,7 @@ export function TradeHistory() {
                       trade.is_open ? 'text-accent-blue' :
                       isProfit ? 'text-accent-green' : 'text-accent-red'
                     }`}>
-                      {trade.is_open ? 'OPEN' : `${isProfit ? '+' : ''}$${pnlLev.toFixed(4)}`}
+                      {trade.is_open ? 'OPEN' : `${isProfit ? '+' : ''}$${pnl.toFixed(2)}`}
                     </td>
                     <td className={`py-2 px-2 ${reasonColor}`}>
                       {reason}
