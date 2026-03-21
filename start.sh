@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ─────────────────────────────────────────────
 # Start the trading bot + dashboard locally
 # ─────────────────────────────────────────────
@@ -8,8 +8,33 @@
 #   - Dashboard:    http://localhost:3000
 # ─────────────────────────────────────────────
 
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "ERROR: start.sh must be run with bash."
+    echo "On Windows PowerShell, use: ./start.ps1 (or ./start.cmd)"
+    exit 1
+fi
+
+# Detect venv paths for POSIX vs Git Bash on Windows.
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+case "$UNAME_S" in
+    MINGW*|MSYS*|CYGWIN*)
+        VENV_PYTHON=".venv/Scripts/python.exe"
+        VENV_PIP=".venv/Scripts/pip.exe"
+        VENV_ACTIVATE=".venv/Scripts/activate"
+        PYTHON_BOOTSTRAP="python"
+        ;;
+    *)
+        VENV_PYTHON=".venv/bin/python"
+        VENV_PIP=".venv/bin/pip"
+        VENV_ACTIVATE=".venv/bin/activate"
+        PYTHON_BOOTSTRAP="python3"
+        ;;
+esac
 
 # Check .env exists
 if [ ! -f .env ]; then
@@ -19,26 +44,38 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
+if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm is not installed or not in PATH."
+    echo "Install Node.js, then run this script again."
+    exit 1
+fi
+
 # ─── Python Virtual Environment ───
 VENV_DIR="$SCRIPT_DIR/.venv"
 
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating Python virtual environment..."
-    python3 -m venv "$VENV_DIR"
+    if ! command -v "$PYTHON_BOOTSTRAP" >/dev/null 2>&1; then
+        echo "ERROR: $PYTHON_BOOTSTRAP is not installed or not in PATH."
+        echo "Install Python, then run this script again."
+        exit 1
+    fi
+
+    "$PYTHON_BOOTSTRAP" -m venv "$VENV_DIR"
     echo "Installing Python dependencies (first time only)..."
-    "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install fastapi "uvicorn[standard]" ccxt numpy aiofiles
+    "$VENV_PIP" install --upgrade pip
+    "$VENV_PIP" install -r requirements.txt
     echo "Python setup complete."
     echo ""
 fi
 
 # Activate venv for this script
-source "$VENV_DIR/bin/activate"
+source "$VENV_ACTIVATE"
 
 # Quick check — install anything missing
 python -c "import fastapi" 2>/dev/null || {
     echo "Installing missing Python dependencies..."
-    pip install fastapi "uvicorn[standard]" ccxt numpy aiofiles
+    pip install -r requirements.txt
 }
 
 # ─── Node.js Dashboard ───
@@ -85,7 +122,18 @@ BACKEND_PID=$!
 # Wait for backend to be ready before starting frontend
 echo "     Waiting for API to be ready..."
 for i in $(seq 1 30); do
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
+        if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+            echo "     API is ready!"
+            break
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -qO- http://localhost:8000/health > /dev/null 2>&1; then
+            echo "     API is ready!"
+            break
+        fi
+    else
+        # If no HTTP client is available, don't block startup forever.
         echo "     API is ready!"
         break
     fi

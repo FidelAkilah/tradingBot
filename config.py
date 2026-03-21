@@ -77,7 +77,7 @@ class OrderBookConfig:
     vpin_safe_threshold: float = 0.5        # Wider safe zone (was 0.4)
     vpin_ema_alpha: float = 0.05            # Slower EMA (was 0.1)
     vpin_regime_window: int = 30
-    vpin_block_entry_above: float = 0.95    # Almost never block (was 0.8)
+    vpin_block_entry_above: float = 0.99    # Only block at extreme (was 0.95, which blocked too often)
     vpin_widen_stops_above: float = 0.85    # Only widen at extreme (was 0.65)
     vpin_stop_multiplier: float = 1.3       # Less aggressive widening (was 1.5)
 
@@ -107,8 +107,10 @@ class CandleConfig:
     # --- Volume Confirmation ---
     volume_surge_multiplier: float = 1.5   # Volume > 1.5x avg = confirmation
 
-    # --- Minimum Trend Strength ---
-    min_adx_equivalent: float = 20.0       # Skip choppy markets (uses EMA slope as proxy)
+    # --- ADX Trend Strength Filter ---
+    adx_period: int = 14
+    adx_trending_threshold: float = 25.0   # ADX > 25 = trending → +0.10 confidence
+    adx_ranging_threshold: float = 20.0    # ADX < 20 = ranging → hard block (reject signal)
 
 
 @dataclass
@@ -140,6 +142,10 @@ class TradingConfig:
     position_pct_of_equity: float = 0.30
     max_open_positions: int = 2              # Max 2 concurrent (was 3)
 
+    # --- Fee-Aware Trading ---
+    fee_rate: float = 0.04                  # Binance futures taker fee per side (0.04%)
+    min_post_fee_rr: float = 1.5            # Reject trades where post-fee R:R < 1.5:1
+
     # --- Swing Targets (ATR-based, these are fallbacks) ---
     take_profit_pct: float = 2.0            # 2% TP (was 0.15% — that was the problem)
     stop_loss_pct: float = 1.0              # 1% SL (was 0.5%)
@@ -169,7 +175,7 @@ class RiskConfig:
     """Global risk management."""
     max_daily_loss_usd: float = 10.0        # ~Rp 163,000 max daily loss
     max_daily_loss_pct: float = 10.0        # Or 10% of equity
-    max_daily_trades: int = 10              # Much fewer trades (was 50)
+    max_daily_trades: int = 25              # 5 pairs x ~5 trades each
     cooldown_after_loss_s: float = 300.0    # 5 min cooldown (was 30s)
     max_drawdown_pct: float = 25.0          # More room for swing (was 10%)
 

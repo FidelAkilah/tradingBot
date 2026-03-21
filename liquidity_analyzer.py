@@ -114,8 +114,13 @@ class AnalysisResult:
     swing: Optional[SwingSignal] = None    # Multi-timeframe candle signal
     composite_score: float = 0.0           # -1.0 (strong bearish) to +1.0 (strong bullish)
     trade_suggestion: Optional[str] = None # "BUY", "SELL", or None
-    atr_tp_pct: float = 0.0               # ATR-based take profit %
-    atr_sl_pct: float = 0.0               # ATR-based stop loss %
+    atr_tp_pct: float = 0.0               # ATR-based take profit % (fee-adjusted)
+    atr_sl_pct: float = 0.0               # ATR-based stop loss % (fee-adjusted)
+    raw_tp_pct: float = 0.0               # Pre-fee TP %
+    raw_sl_pct: float = 0.0               # Pre-fee SL %
+    fee_cost_pct: float = 0.0             # Round-trip fee as % of notional
+    post_fee_rr: float = 0.0              # Risk-reward ratio after fees
+    adx: float = 0.0                       # Primary ADX value
 
 
 # ─────────────────────────────────────────────
@@ -203,9 +208,18 @@ class LiquidityAnalyzer:
         # 8. Trade Suggestion (candle trend is primary driver)
         suggestion = self._trade_suggestion(composite, spread_pct, bid_walls, ask_walls, vpin_state, swing_signal)
 
-        # ATR-based TP/SL
+        # ATR-based TP/SL (fee-adjusted values from swing signal)
         atr_tp = swing_signal.atr_tp_pct if swing_signal else self.config.trading.take_profit_pct
         atr_sl = swing_signal.atr_sl_pct if swing_signal else self.config.trading.stop_loss_pct
+
+        # Fee metrics from swing signal
+        raw_tp = swing_signal.raw_tp_pct if swing_signal else 0.0
+        raw_sl = swing_signal.raw_sl_pct if swing_signal else 0.0
+        fee_cost = swing_signal.fee_cost_pct if swing_signal else 0.0
+        post_fee_rr = swing_signal.post_fee_rr if swing_signal else 0.0
+        adx_val = swing_signal.adx_4h if swing_signal and swing_signal.adx_4h > 0 else (
+            swing_signal.adx_1h if swing_signal else 0.0
+        )
 
         result = AnalysisResult(
             symbol=symbol,
@@ -223,6 +237,11 @@ class LiquidityAnalyzer:
             trade_suggestion=suggestion,
             atr_tp_pct=atr_tp if atr_tp > 0 else self.config.trading.take_profit_pct,
             atr_sl_pct=atr_sl if atr_sl > 0 else self.config.trading.stop_loss_pct,
+            raw_tp_pct=raw_tp,
+            raw_sl_pct=raw_sl,
+            fee_cost_pct=fee_cost,
+            post_fee_rr=post_fee_rr,
+            adx=adx_val,
         )
 
         self._result_history[symbol].append(result)
@@ -644,6 +663,24 @@ class LiquidityAnalyzer:
         if vpin and vpin.bucket_count > 0:
             vpin_signal = np.clip(vpin.directional_bias * 2.0, -1.0, 1.0)
 
+        # OB imbalance confirmation: if imbalance agrees with swing direction, +0.05 confidence
+        if swing and swing.suggested_side:
+            imb_confirms = False
+            if swing.suggested_side == "BUY" and imbalance.direction == SignalDirection.BULLISH:
+                imb_confirms = True
+            elif swing.suggested_side == "SELL" and imbalance.direction == SignalDirection.BEARISH:
+                imb_confirms = True
+            if imb_confirms:
+                swing.confidence = min(swing.confidence + 0.05, 1.0)
+                # Re-derive swing_signal_val with updated confidence
+                if swing.suggested_side == "BUY":
+                    swing_signal_val = swing.confidence
+                else:
+                    swing_signal_val = -swing.confidence
+                if swing.trend_aligned:
+                    swing_signal_val *= 1.2
+                swing_signal_val = float(np.clip(swing_signal_val, -1.0, 1.0))
+
         # Weighted composite — candle-driven
         if swing and swing.suggested_side:
             composite = (
@@ -691,6 +728,8 @@ class LiquidityAnalyzer:
         For swing trades, walls are optional confirmation, not required.
         The candle setup (trend + RSI + ATR) is what triggers the trade.
         A supporting wall just boosts confidence.
+
+        Min confidence raised to 0.55 (from 0.30). OB imbalance can add +0.05.
         """
         max_spread = self.config.trading.max_spread_pct
         if spread_pct > max_spread:
@@ -700,20 +739,24 @@ class LiquidityAnalyzer:
         if vpin and vpin.should_block_entry:
             return None
 
-        # Require candle signal for swing trades
+        # ADX block: candle_analyzer already set suggested_side=None,
+        # but double-check here
+        if swing and swing.adx_blocked:
+            return None
+
         COMPOSITE_THRESHOLD = 0.25
+        MIN_CONFIDENCE = 0.55
 
         if composite >= COMPOSITE_THRESHOLD:
-            # For swing: candle trend must agree (wall is optional bonus)
-            if swing and swing.suggested_side == "BUY" and swing.confidence >= 0.3:
+            if swing and swing.suggested_side == "BUY" and swing.confidence >= MIN_CONFIDENCE:
                 return "BUY"
-            # OB-only trade needs a wall AND higher threshold
+            # OB-only trade needs a wall AND higher threshold (no change)
             genuine_bid_walls = [w for w in bid_walls if not w.is_spoof_suspect and w.confidence > 0.5]
             if genuine_bid_walls and composite >= 0.5:
                 return "BUY"
 
         elif composite <= -COMPOSITE_THRESHOLD:
-            if swing and swing.suggested_side == "SELL" and swing.confidence >= 0.3:
+            if swing and swing.suggested_side == "SELL" and swing.confidence >= MIN_CONFIDENCE:
                 return "SELL"
             genuine_ask_walls = [w for w in ask_walls if not w.is_spoof_suspect and w.confidence > 0.5]
             if genuine_ask_walls and composite <= -0.5:

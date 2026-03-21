@@ -10,6 +10,7 @@ Enforces:
 - Position sizing constraints
 """
 
+import datetime
 import logging
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,9 @@ class RiskManager:
         Returns:
             (allowed: bool, reason: str)
         """
+        # Auto-reset daily counters at UTC midnight
+        self._check_daily_reset()
+
         if self.state.is_halted:
             return False, f"Trading halted: {self.state.halt_reason}"
 
@@ -180,6 +184,19 @@ class RiskManager:
     # ─────────────────────────────────────────
     # STATE MANAGEMENT
     # ─────────────────────────────────────────
+
+    def _check_daily_reset(self):
+        """Auto-reset daily counters when a new UTC day begins."""
+        now_utc = datetime.datetime.utcnow().date()
+        session_utc = datetime.datetime.utcfromtimestamp(self.state.session_start).date()
+        if now_utc > session_utc:
+            logger.info(
+                f"New trading day ({now_utc}). Resetting daily counters. "
+                f"Previous day: {self.state.daily_trade_count} trades, "
+                f"PnL: ${self.state.daily_pnl:+.2f}"
+            )
+            self.reset_daily(new_equity=self.state.current_equity)
+            self.state.session_start = time.time()
 
     def _halt(self, reason: str):
         """Halt all trading."""

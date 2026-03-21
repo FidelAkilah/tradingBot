@@ -102,6 +102,12 @@ class BotRunner:
 
     def _hook_shadow_trader(self, shadow):
         """Monkey-patch shadow trader to also write to DB."""
+        # Sync trade counter from DB so IDs never collide across restarts
+        max_id = db.get_max_trade_id()
+        if max_id > 0:
+            shadow._trade_counter = max_id
+            logger.info(f"Shadow trade counter synced to {max_id}")
+
         original_log_trade = shadow._log_trade
         original_log_signal = shadow._log_signal
 
@@ -122,6 +128,8 @@ class BotRunner:
                         pnl_pct=trade.pnl_pct or 0,
                         duration_s=trade.duration_s or 0,
                         exit_time=trade.exit_time or time.time(),
+                        gross_pnl_usd=getattr(trade, 'gross_pnl_usd', None),
+                        fee_cost_usd=getattr(trade, 'fee_cost_usd', None),
                     )
             except Exception as e:
                 logger.error(f"DB trade log error: {e}")
@@ -142,6 +150,9 @@ class BotRunner:
                     'vpin_regime': analysis.vpin.regime.value,
                     'atr_tp_pct': analysis.atr_tp_pct,
                     'atr_sl_pct': analysis.atr_sl_pct,
+                    'adx': getattr(analysis, 'adx', 0.0),
+                    'post_fee_rr': getattr(analysis, 'post_fee_rr', 0.0),
+                    'adx_blocked': swing.adx_blocked if swing else False,
                 })
             except Exception as e:
                 logger.error(f"DB signal log error: {e}")
@@ -217,6 +228,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     db.init_db()
+    stale = db.close_stale_trades()
+    if stale:
+        logger.info(f"Closed {stale} orphaned trade(s) from previous session")
     logger.info("Database initialized")
 
     # Auto-start bot if API keys are configured

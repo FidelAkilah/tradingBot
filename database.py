@@ -30,7 +30,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, then run migrations for new columns."""
     conn = get_conn()
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -92,6 +92,31 @@ def init_db():
     """)
     conn.commit()
 
+    # --- Migrations: add fee-aware and ADX columns (backward compatible) ---
+    _migrate_add_columns(conn, "trades", {
+        "gross_pnl_usd": "REAL",
+        "fee_cost_usd": "REAL",
+        "raw_tp_pct": "REAL",
+        "raw_sl_pct": "REAL",
+        "fee_cost_pct": "REAL",
+        "post_fee_rr": "REAL",
+        "adx": "REAL",
+    })
+    _migrate_add_columns(conn, "signals", {
+        "adx": "REAL",
+        "post_fee_rr": "REAL",
+        "adx_blocked": "INTEGER",
+    })
+
+
+def _migrate_add_columns(conn, table: str, columns: dict):
+    """Add columns to a table if they don't already exist."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col_name, col_type in columns.items():
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+    conn.commit()
+
 
 # ─────────────────────────────────────────
 # TRADES
@@ -99,14 +124,18 @@ def init_db():
 
 def insert_trade(trade_data: Dict[str, Any]) -> int:
     conn = get_conn()
-    extra = {k: v for k, v in trade_data.items() if k not in {
+    known_cols = {
         'trade_id', 'symbol', 'side', 'entry_price', 'exit_price',
         'target_price', 'stop_price', 'amount', 'usd_value',
         'pnl_usd', 'pnl_pct', 'composite_score', 'swing_trend',
         'swing_confidence', 'atr_tp_pct', 'atr_sl_pct', 'vpin',
         'vpin_regime', 'entry_time', 'exit_time', 'exit_reason',
         'duration_s', 'is_open', 'leverage',
-    }}
+        # Fee-aware and ADX columns
+        'gross_pnl_usd', 'fee_cost_usd', 'raw_tp_pct', 'raw_sl_pct',
+        'fee_cost_pct', 'post_fee_rr', 'adx',
+    }
+    extra = {k: v for k, v in trade_data.items() if k not in known_cols}
 
     cur = conn.execute("""
     INSERT INTO trades (
@@ -115,14 +144,16 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         composite_score, swing_trend, swing_confidence,
         atr_tp_pct, atr_sl_pct, vpin, vpin_regime,
         entry_time, exit_time, exit_reason, duration_s, is_open,
-        leverage, extra_json
+        leverage, gross_pnl_usd, fee_cost_usd, raw_tp_pct, raw_sl_pct,
+        fee_cost_pct, post_fee_rr, adx, extra_json
     ) VALUES (
         :trade_id, :symbol, :side, :entry_price, :exit_price, :target_price,
         :stop_price, :amount, :usd_value, :pnl_usd, :pnl_pct,
         :composite_score, :swing_trend, :swing_confidence,
         :atr_tp_pct, :atr_sl_pct, :vpin, :vpin_regime,
         :entry_time, :exit_time, :exit_reason, :duration_s, :is_open,
-        :leverage, :extra_json
+        :leverage, :gross_pnl_usd, :fee_cost_usd, :raw_tp_pct, :raw_sl_pct,
+        :fee_cost_pct, :post_fee_rr, :adx, :extra_json
     )
     """, {
         'trade_id': trade_data.get('trade_id'),
@@ -149,6 +180,13 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         'duration_s': trade_data.get('duration_s'),
         'is_open': 1 if trade_data.get('is_open', True) else 0,
         'leverage': trade_data.get('leverage', 30),
+        'gross_pnl_usd': trade_data.get('gross_pnl_usd'),
+        'fee_cost_usd': trade_data.get('fee_cost_usd'),
+        'raw_tp_pct': trade_data.get('raw_tp_pct'),
+        'raw_sl_pct': trade_data.get('raw_sl_pct'),
+        'fee_cost_pct': trade_data.get('fee_cost_pct'),
+        'post_fee_rr': trade_data.get('post_fee_rr'),
+        'adx': trade_data.get('adx'),
         'extra_json': json.dumps(extra, default=str) if extra else None,
     })
     conn.commit()
@@ -157,14 +195,17 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
 
 def update_trade_close(trade_id: int, exit_price: float, exit_reason: str,
                        pnl_usd: float, pnl_pct: float, duration_s: float,
-                       exit_time: float):
+                       exit_time: float, gross_pnl_usd: float = None,
+                       fee_cost_usd: float = None):
     conn = get_conn()
     conn.execute("""
     UPDATE trades SET
         exit_price = ?, exit_reason = ?, pnl_usd = ?, pnl_pct = ?,
-        duration_s = ?, exit_time = ?, is_open = 0
+        duration_s = ?, exit_time = ?, is_open = 0,
+        gross_pnl_usd = ?, fee_cost_usd = ?
     WHERE trade_id = ? AND is_open = 1
-    """, (exit_price, exit_reason, pnl_usd, pnl_pct, duration_s, exit_time, trade_id))
+    """, (exit_price, exit_reason, pnl_usd, pnl_pct, duration_s, exit_time,
+          gross_pnl_usd, fee_cost_usd, trade_id))
     conn.commit()
 
 
@@ -189,23 +230,57 @@ def get_open_trades() -> List[dict]:
     return get_trades(limit=100, open_only=True)
 
 
+def get_max_trade_id() -> int:
+    """Return the highest trade_id in the database (0 if empty)."""
+    conn = get_conn()
+    row = conn.execute("SELECT COALESCE(MAX(trade_id), 0) as m FROM trades").fetchone()
+    return row["m"]
+
+
+def close_stale_trades():
+    """Mark orphaned open trades from previous sessions as closed.
+
+    When the bot restarts, in-memory state is lost but the DB still has
+    is_open = 1 rows.  These can never be properly closed, and their
+    trade_ids will collide with new trades, corrupting exit data.
+    """
+    conn = get_conn()
+    count = conn.execute("SELECT COUNT(*) as c FROM trades WHERE is_open = 1").fetchone()["c"]
+    if count > 0:
+        conn.execute("""
+        UPDATE trades SET
+            is_open = 0,
+            exit_reason = COALESCE(exit_reason, 'bot_restart'),
+            exit_time = COALESCE(exit_time, ?),
+            pnl_usd = COALESCE(pnl_usd, 0),
+            pnl_pct = COALESCE(pnl_pct, 0),
+            duration_s = COALESCE(duration_s, 0)
+        WHERE is_open = 1
+        """, (time.time(),))
+        conn.commit()
+    return count
+
+
 # ─────────────────────────────────────────
 # SIGNALS
 # ─────────────────────────────────────────
 
 def insert_signal(signal_data: Dict[str, Any]):
     conn = get_conn()
-    extra = {k: v for k, v in signal_data.items() if k not in {
+    known_cols = {
         'timestamp', 'symbol', 'mid_price', 'composite_score',
         'suggestion', 'swing_trend', 'swing_confidence',
         'vpin', 'vpin_regime', 'atr_tp_pct', 'atr_sl_pct',
-    }}
+        'adx', 'post_fee_rr', 'adx_blocked',
+    }
+    extra = {k: v for k, v in signal_data.items() if k not in known_cols}
     conn.execute("""
     INSERT INTO signals (
         timestamp, symbol, mid_price, composite_score, suggestion,
         swing_trend, swing_confidence, vpin, vpin_regime,
-        atr_tp_pct, atr_sl_pct, extra_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        atr_tp_pct, atr_sl_pct, adx, post_fee_rr, adx_blocked,
+        extra_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_data.get('timestamp'),
         signal_data.get('symbol'),
@@ -218,6 +293,9 @@ def insert_signal(signal_data: Dict[str, Any]):
         signal_data.get('vpin_regime'),
         signal_data.get('atr_tp_pct'),
         signal_data.get('atr_sl_pct'),
+        signal_data.get('adx'),
+        signal_data.get('post_fee_rr'),
+        1 if signal_data.get('adx_blocked') else 0,
         json.dumps(extra, default=str) if extra else None,
     ))
     conn.commit()

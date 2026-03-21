@@ -50,14 +50,21 @@ class ShadowTrade:
     swing_trend_aligned: bool = False
     rsi_1h: float = 50.0
     rsi_4h: float = 50.0
-    atr_tp_pct: float = 0.0         # ATR-derived TP %
-    atr_sl_pct: float = 0.0         # ATR-derived SL %
+    atr_tp_pct: float = 0.0         # ATR-derived TP % (fee-adjusted)
+    atr_sl_pct: float = 0.0         # ATR-derived SL % (fee-adjusted)
+    raw_tp_pct: float = 0.0         # Pre-fee TP %
+    raw_sl_pct: float = 0.0         # Pre-fee SL %
+    fee_cost_pct: float = 0.0       # Round-trip fee as % of notional
+    post_fee_rr: float = 0.0        # Risk-reward ratio after fees
+    adx: float = 0.0                # ADX at entry (primary timeframe)
     entry_time: float = 0.0
     exit_time: Optional[float] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
-    pnl_usd: Optional[float] = None
-    pnl_pct: Optional[float] = None
+    gross_pnl_usd: Optional[float] = None   # P&L before fees
+    fee_cost_usd: Optional[float] = None     # Actual fee cost in USD
+    pnl_usd: Optional[float] = None          # Net P&L after fees
+    pnl_pct: Optional[float] = None          # Net P&L % (of margin)
     duration_s: Optional[float] = None
     is_open: bool = True
 
@@ -81,7 +88,7 @@ class ShadowTrader:
 
         # Per-symbol cooldown tracking: symbol -> time of last close
         self._last_close_time: Dict[str, float] = {}
-        self._symbol_cooldown_s = 60.0  # 60s cooldown after any trade close
+        self._symbol_cooldown_s = 300.0  # 5 min cooldown — swing bot, not scalper
 
         # Latest known price per symbol (for live unrealized P&L)
         self.last_prices: Dict[str, float] = {}
@@ -90,6 +97,10 @@ class ShadowTrader:
         self.total_pnl = 0.0
         self.wins = 0
         self.losses = 0
+
+        # Trailing stop tracking (peak price for longs, trough for shorts)
+        self._peak_prices: Dict[str, float] = {}
+        self._trough_prices: Dict[str, float] = {}
 
         # Log file
         self._log_path = os.path.join(
@@ -141,9 +152,7 @@ class ShadowTrader:
         """Open a simulated long position."""
         walls = [w for w in analysis.bid_walls if not w.is_spoof_suspect and w.confidence > 0.5]
         if not walls:
-            # For swing trades, walls are optional confirmation — allow entry without walls
-            # if candle signal is strong enough
-            if not (hasattr(analysis, 'swing') and analysis.swing and analysis.swing.confidence >= 0.6):
+            if not (hasattr(analysis, 'swing') and analysis.swing and analysis.swing.confidence >= 0.55):
                 return None
 
         wall = walls[0] if walls else None
@@ -151,18 +160,13 @@ class ShadowTrader:
         fc = self.config.futures
         mid = analysis.mid_price
 
-        if wall:
-            offset = mid * (tc.offset_from_wall_pct / 100.0)
-            entry_price = wall.price + offset
-        else:
-            entry_price = mid  # Enter at mid if no wall (candle-driven entry)
+        entry_price = mid
 
-        # Position size: margin * leverage = notional, then convert to asset amount
         leverage = fc.leverage if fc.enabled else 1
         notional_usd = tc.max_position_usd * leverage
         amount = notional_usd / entry_price
 
-        # Use ATR-based dynamic TP/SL if available, fall back to config
+        # Fee-adjusted TP/SL from analysis (already includes fee compensation)
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
         sl_pct = analysis.atr_sl_pct if analysis.atr_sl_pct > 0 else tc.stop_loss_pct
 
@@ -204,6 +208,11 @@ class ShadowTrader:
             rsi_4h=rsi_4h,
             atr_tp_pct=tp_pct,
             atr_sl_pct=sl_pct,
+            raw_tp_pct=getattr(analysis, 'raw_tp_pct', 0.0),
+            raw_sl_pct=getattr(analysis, 'raw_sl_pct', 0.0),
+            fee_cost_pct=getattr(analysis, 'fee_cost_pct', 0.0),
+            post_fee_rr=getattr(analysis, 'post_fee_rr', 0.0),
+            adx=getattr(analysis, 'adx', 0.0),
             entry_time=entry_time,
         )
 
@@ -215,7 +224,8 @@ class ShadowTrader:
             f"@ {trade.entry_price:.2f} | wall=${trade.wall_usd_value:,.0f} "
             f"| TP={trade.target_price:.2f} ({tp_pct:.2f}%) "
             f"| SL={trade.stop_price:.2f} ({sl_pct:.2f}%) "
-            f"| trend={swing_trend} conf={swing_conf:.2f} "
+            f"| trend={swing_trend} conf={swing_conf:.2f} ADX={trade.adx:.1f} "
+            f"| post-fee R:R={trade.post_fee_rr:.2f} "
             f"| score={trade.composite_score:+.3f} | vpin={trade.vpin:.3f}"
         )
 
@@ -225,8 +235,7 @@ class ShadowTrader:
         """Open a simulated short position."""
         walls = [w for w in analysis.ask_walls if not w.is_spoof_suspect and w.confidence > 0.5]
         if not walls:
-            # For swing trades, walls are optional — allow entry on strong candle signal
-            if not (hasattr(analysis, 'swing') and analysis.swing and analysis.swing.confidence >= 0.6):
+            if not (hasattr(analysis, 'swing') and analysis.swing and analysis.swing.confidence >= 0.55):
                 return None
 
         wall = walls[0] if walls else None
@@ -234,22 +243,15 @@ class ShadowTrader:
         fc = self.config.futures
         mid = analysis.mid_price
 
-        if wall:
-            offset = mid * (tc.offset_from_wall_pct / 100.0)
-            entry_price = wall.price - offset
-        else:
-            entry_price = mid  # Enter at mid if no wall (candle-driven entry)
+        entry_price = mid
 
-        # Position size: margin * leverage = notional, then convert to asset amount
         leverage = fc.leverage if fc.enabled else 1
         notional_usd = tc.max_position_usd * leverage
         amount = notional_usd / entry_price
 
-        # Use ATR-based dynamic TP/SL if available, fall back to config
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
         sl_pct = analysis.atr_sl_pct if analysis.atr_sl_pct > 0 else tc.stop_loss_pct
 
-        # Extract swing signal info
         swing = getattr(analysis, 'swing', None)
         swing_trend = swing.primary_trend.value if swing else "neutral"
         swing_conf = swing.confidence if swing else 0.0
@@ -287,6 +289,11 @@ class ShadowTrader:
             rsi_4h=rsi_4h,
             atr_tp_pct=tp_pct,
             atr_sl_pct=sl_pct,
+            raw_tp_pct=getattr(analysis, 'raw_tp_pct', 0.0),
+            raw_sl_pct=getattr(analysis, 'raw_sl_pct', 0.0),
+            fee_cost_pct=getattr(analysis, 'fee_cost_pct', 0.0),
+            post_fee_rr=getattr(analysis, 'post_fee_rr', 0.0),
+            adx=getattr(analysis, 'adx', 0.0),
             entry_time=entry_time,
         )
 
@@ -298,7 +305,8 @@ class ShadowTrader:
             f"@ {trade.entry_price:.2f} | wall=${trade.wall_usd_value:,.0f} "
             f"| TP={trade.target_price:.2f} ({tp_pct:.2f}%) "
             f"| SL={trade.stop_price:.2f} ({sl_pct:.2f}%) "
-            f"| trend={swing_trend} conf={swing_conf:.2f} "
+            f"| trend={swing_trend} conf={swing_conf:.2f} ADX={trade.adx:.1f} "
+            f"| post-fee R:R={trade.post_fee_rr:.2f} "
             f"| score={trade.composite_score:+.3f} | vpin={trade.vpin:.3f}"
         )
 
@@ -323,23 +331,56 @@ class ShadowTrader:
         trade = self.open_trades[symbol]
         now = time.time()
 
-        # Don't check TP/SL within first 2 seconds — prevents same-tick close
-        if now - trade.entry_time < 2.0:
+        # Don't check anything within first 2 seconds — prevents same-tick close
+        hold_time = now - trade.entry_time
+        if hold_time < 2.0:
             return None
+
+        min_hold = self.config.trading.min_hold_time_s  # 30 min default
+
+        # --- Trailing Stop ---
+        # Only activates after min_hold AND price reaches 50% of TP distance.
+        # This prevents tick-noise from triggering trailing exits on a swing bot.
+        trailing_pct = self.config.trading.trailing_stop_pct
+        if trailing_pct > 0 and hold_time >= min_hold:
+            if trade.side == "BUY":
+                tp_dist = trade.target_price - trade.entry_price
+                activation_price = trade.entry_price + (tp_dist * 0.5)
+                if current_price >= activation_price:
+                    peak = self._peak_prices.get(symbol, current_price)
+                    if current_price > peak:
+                        peak = current_price
+                        self._peak_prices[symbol] = peak
+                    trailing_stop = peak * (1.0 - trailing_pct / 100.0)
+                    if trailing_stop > trade.stop_price:
+                        trade.stop_price = trailing_stop
+            else:  # SELL
+                tp_dist = trade.entry_price - trade.target_price
+                activation_price = trade.entry_price - (tp_dist * 0.5)
+                if current_price <= activation_price:
+                    trough = self._trough_prices.get(symbol, current_price)
+                    if current_price < trough:
+                        trough = current_price
+                        self._trough_prices[symbol] = trough
+                    trailing_stop = trough * (1.0 + trailing_pct / 100.0)
+                    if trailing_stop < trade.stop_price:
+                        trade.stop_price = trailing_stop
 
         exit_reason = None
         exit_price = current_price
 
+        # TP only triggers after min_hold_time — this is a swing bot, not a scalper.
+        # SL always triggers immediately to protect capital.
         if trade.side == "BUY":
-            if current_price >= trade.target_price:
+            if current_price >= trade.target_price and hold_time >= min_hold:
                 exit_reason = "take_profit"
             elif current_price <= trade.stop_price:
-                exit_reason = "stop_loss"
+                exit_reason = "trailing_stop" if trade.stop_price > trade.entry_price else "stop_loss"
         else:  # SELL
-            if current_price <= trade.target_price:
+            if current_price <= trade.target_price and hold_time >= min_hold:
                 exit_reason = "take_profit"
             elif current_price >= trade.stop_price:
-                exit_reason = "stop_loss"
+                exit_reason = "trailing_stop" if trade.stop_price < trade.entry_price else "stop_loss"
 
         if exit_reason:
             return self._close_trade(trade, exit_price, exit_reason, now)
@@ -364,25 +405,36 @@ class ShadowTrader:
         """Close a shadow trade and record results.
 
         P&L already reflects leverage because amount = (margin * leverage) / price.
+        Fee cost is computed on the notional value (entry + exit legs).
         """
         if trade.side == "BUY":
-            pnl = (exit_price - trade.entry_price) * trade.amount
+            gross_pnl = (exit_price - trade.entry_price) * trade.amount
         else:
-            pnl = (trade.entry_price - exit_price) * trade.amount
+            gross_pnl = (trade.entry_price - exit_price) * trade.amount
 
-        pnl_pct = (pnl / trade.usd_value) * 100.0
+        # Fee calculation: fee on entry notional + fee on exit notional
+        tc = self.config.trading
+        fee_rate = tc.fee_rate / 100.0  # Convert from % to decimal (0.04% -> 0.0004)
+        entry_notional = trade.entry_price * trade.amount
+        exit_notional = exit_price * trade.amount
+        fee_cost = (entry_notional + exit_notional) * fee_rate
+
+        net_pnl = gross_pnl - fee_cost
+        net_pnl_pct = (net_pnl / trade.usd_value) * 100.0
 
         trade.exit_time = exit_time
         trade.exit_price = exit_price
         trade.exit_reason = reason
-        trade.pnl_usd = pnl
-        trade.pnl_pct = pnl_pct
+        trade.gross_pnl_usd = gross_pnl
+        trade.fee_cost_usd = fee_cost
+        trade.pnl_usd = net_pnl
+        trade.pnl_pct = net_pnl_pct
         trade.duration_s = exit_time - trade.entry_time
         trade.is_open = False
 
-        # Update stats
-        self.total_pnl += pnl
-        if pnl > 0:
+        # Update stats with NET P&L (after fees)
+        self.total_pnl += net_pnl
+        if net_pnl > 0:
             self.wins += 1
         else:
             self.losses += 1
@@ -391,13 +443,16 @@ class ShadowTrader:
         del self.open_trades[trade.symbol]
         self.closed_trades.append(trade)
         self._last_close_time[trade.symbol] = exit_time
+        self._peak_prices.pop(trade.symbol, None)
+        self._trough_prices.pop(trade.symbol, None)
 
         self._log_trade(trade, "CLOSE")
 
         logger.info(
             f"[SHADOW CLOSE] {trade.side} {trade.symbol} "
             f"@ {exit_price:.2f} | reason={reason} "
-            f"| PnL=${pnl:+.2f} ({pnl_pct:+.2f}%) "
+            f"| gross=${gross_pnl:+.2f} fees=${fee_cost:.2f} "
+            f"| net=${net_pnl:+.2f} ({net_pnl_pct:+.2f}%) "
             f"| duration={trade.duration_s:.1f}s"
         )
 
@@ -407,7 +462,7 @@ class ShadowTrader:
             entry_price=trade.entry_price,
             exit_price=exit_price,
             amount=trade.amount,
-            pnl_usd=pnl,
+            pnl_usd=net_pnl,
             reason=reason,
             timestamp=exit_time,
         )
@@ -461,6 +516,16 @@ class ShadowTrader:
             "rsi_4h": swing.rsi_4h if swing else 0.0,
             "atr_tp_pct": analysis.atr_tp_pct,
             "atr_sl_pct": analysis.atr_sl_pct,
+            # Fee-aware metrics
+            "raw_tp_pct": getattr(analysis, 'raw_tp_pct', 0.0),
+            "raw_sl_pct": getattr(analysis, 'raw_sl_pct', 0.0),
+            "fee_cost_pct": getattr(analysis, 'fee_cost_pct', 0.0),
+            "post_fee_rr": getattr(analysis, 'post_fee_rr', 0.0),
+            # ADX
+            "adx": getattr(analysis, 'adx', 0.0),
+            "adx_1h": swing.adx_1h if swing else 0.0,
+            "adx_4h": swing.adx_4h if swing else 0.0,
+            "adx_blocked": swing.adx_blocked if swing else False,
         }
         try:
             with open(self._signal_log_path, "a") as f:
