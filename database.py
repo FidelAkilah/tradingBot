@@ -101,11 +101,29 @@ def init_db():
         "fee_cost_pct": "REAL",
         "post_fee_rr": "REAL",
         "adx": "REAL",
+        "regime": "TEXT",
+        "regime_size_mult": "REAL",
+        "regime_is_breakout": "INTEGER",
+        "session": "TEXT",
+        "session_size_mult": "REAL",
+        # Position sizing columns
+        "kelly_pct": "REAL",
+        "confidence_mult": "REAL",
+        "drawdown_mult": "REAL",
+        "drawdown_pct": "REAL",
+        "consec_loss_mult": "REAL",
+        "consecutive_losses": "INTEGER",
     })
     _migrate_add_columns(conn, "signals", {
         "adx": "REAL",
         "post_fee_rr": "REAL",
         "adx_blocked": "INTEGER",
+        "regime": "TEXT",
+        "regime_blocked": "INTEGER",
+        "regime_is_breakout": "INTEGER",
+        "session": "TEXT",
+        "session_blocked": "INTEGER",
+        "session_size_mult": "REAL",
     })
 
 
@@ -134,6 +152,12 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         # Fee-aware and ADX columns
         'gross_pnl_usd', 'fee_cost_usd', 'raw_tp_pct', 'raw_sl_pct',
         'fee_cost_pct', 'post_fee_rr', 'adx',
+        # Regime and session columns
+        'regime', 'regime_size_mult', 'regime_is_breakout',
+        'session', 'session_size_mult',
+        # Position sizing columns
+        'kelly_pct', 'confidence_mult', 'drawdown_mult',
+        'drawdown_pct', 'consec_loss_mult', 'consecutive_losses',
     }
     extra = {k: v for k, v in trade_data.items() if k not in known_cols}
 
@@ -145,7 +169,12 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         atr_tp_pct, atr_sl_pct, vpin, vpin_regime,
         entry_time, exit_time, exit_reason, duration_s, is_open,
         leverage, gross_pnl_usd, fee_cost_usd, raw_tp_pct, raw_sl_pct,
-        fee_cost_pct, post_fee_rr, adx, extra_json
+        fee_cost_pct, post_fee_rr, adx,
+        regime, regime_size_mult, regime_is_breakout,
+        session, session_size_mult,
+        kelly_pct, confidence_mult, drawdown_mult,
+        drawdown_pct, consec_loss_mult, consecutive_losses,
+        extra_json
     ) VALUES (
         :trade_id, :symbol, :side, :entry_price, :exit_price, :target_price,
         :stop_price, :amount, :usd_value, :pnl_usd, :pnl_pct,
@@ -153,7 +182,12 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         :atr_tp_pct, :atr_sl_pct, :vpin, :vpin_regime,
         :entry_time, :exit_time, :exit_reason, :duration_s, :is_open,
         :leverage, :gross_pnl_usd, :fee_cost_usd, :raw_tp_pct, :raw_sl_pct,
-        :fee_cost_pct, :post_fee_rr, :adx, :extra_json
+        :fee_cost_pct, :post_fee_rr, :adx,
+        :regime, :regime_size_mult, :regime_is_breakout,
+        :session, :session_size_mult,
+        :kelly_pct, :confidence_mult, :drawdown_mult,
+        :drawdown_pct, :consec_loss_mult, :consecutive_losses,
+        :extra_json
     )
     """, {
         'trade_id': trade_data.get('trade_id'),
@@ -179,7 +213,7 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         'exit_reason': trade_data.get('exit_reason'),
         'duration_s': trade_data.get('duration_s'),
         'is_open': 1 if trade_data.get('is_open', True) else 0,
-        'leverage': trade_data.get('leverage', 30),
+        'leverage': trade_data.get('leverage', 10),
         'gross_pnl_usd': trade_data.get('gross_pnl_usd'),
         'fee_cost_usd': trade_data.get('fee_cost_usd'),
         'raw_tp_pct': trade_data.get('raw_tp_pct'),
@@ -187,6 +221,17 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         'fee_cost_pct': trade_data.get('fee_cost_pct'),
         'post_fee_rr': trade_data.get('post_fee_rr'),
         'adx': trade_data.get('adx'),
+        'regime': trade_data.get('regime'),
+        'regime_size_mult': trade_data.get('regime_size_mult'),
+        'regime_is_breakout': 1 if trade_data.get('regime_is_breakout') else 0,
+        'session': trade_data.get('session'),
+        'session_size_mult': trade_data.get('session_size_mult'),
+        'kelly_pct': trade_data.get('kelly_pct'),
+        'confidence_mult': trade_data.get('confidence_mult'),
+        'drawdown_mult': trade_data.get('drawdown_mult'),
+        'drawdown_pct': trade_data.get('drawdown_pct'),
+        'consec_loss_mult': trade_data.get('consec_loss_mult'),
+        'consecutive_losses': trade_data.get('consecutive_losses'),
         'extra_json': json.dumps(extra, default=str) if extra else None,
     })
     conn.commit()
@@ -272,6 +317,8 @@ def insert_signal(signal_data: Dict[str, Any]):
         'suggestion', 'swing_trend', 'swing_confidence',
         'vpin', 'vpin_regime', 'atr_tp_pct', 'atr_sl_pct',
         'adx', 'post_fee_rr', 'adx_blocked',
+        'regime', 'regime_blocked', 'regime_is_breakout',
+        'session', 'session_blocked', 'session_size_mult',
     }
     extra = {k: v for k, v in signal_data.items() if k not in known_cols}
     conn.execute("""
@@ -279,8 +326,10 @@ def insert_signal(signal_data: Dict[str, Any]):
         timestamp, symbol, mid_price, composite_score, suggestion,
         swing_trend, swing_confidence, vpin, vpin_regime,
         atr_tp_pct, atr_sl_pct, adx, post_fee_rr, adx_blocked,
+        regime, regime_blocked, regime_is_breakout,
+        session, session_blocked, session_size_mult,
         extra_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_data.get('timestamp'),
         signal_data.get('symbol'),
@@ -296,6 +345,12 @@ def insert_signal(signal_data: Dict[str, Any]):
         signal_data.get('adx'),
         signal_data.get('post_fee_rr'),
         1 if signal_data.get('adx_blocked') else 0,
+        signal_data.get('regime'),
+        1 if signal_data.get('regime_blocked') else 0,
+        1 if signal_data.get('regime_is_breakout') else 0,
+        signal_data.get('session'),
+        1 if signal_data.get('session_blocked') else 0,
+        signal_data.get('session_size_mult'),
         json.dumps(extra, default=str) if extra else None,
     ))
     conn.commit()

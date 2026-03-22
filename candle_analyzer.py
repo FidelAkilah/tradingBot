@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from config import BotConfig, CONFIG
+from market_regime import MarketRegimeClassifier, RegimeResult, RegimeType
+from session_filter import SessionFilter, SessionResult, SessionType
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,22 @@ class SwingSignal:
     adx_4h: float = 0.0
     adx_blocked: bool = False       # True if ADX < ranging threshold
 
+    # Market regime
+    regime: str = "ranging"         # Combined regime label
+    regime_blocked: bool = False    # True if regime says don't trade
+    regime_size_mult: float = 1.0   # Position size multiplier from regime
+    regime_is_breakout: bool = False
+    regime_breakout_sl_mult: float = 1.0
+    regime_adx_regime: str = "ranging"
+    regime_bb_regime: str = "ranging"
+    regime_ema_regime: str = "ranging"
+    regime_bb_width_pctl: float = 0.0
+
+    # Session filter
+    session: str = "dead_zone"      # Current session label
+    session_blocked: bool = False   # True if session blocks this pair
+    session_size_mult: float = 1.0  # Position size multiplier from session
+
 
 class CandleAnalyzer:
     """
@@ -103,6 +121,10 @@ class CandleAnalyzer:
     def __init__(self, config: BotConfig = CONFIG):
         self.config = config
         self.cc = config.candle
+
+        # Market regime classifier and session filter
+        self._regime = MarketRegimeClassifier(config)
+        self._session = SessionFilter(config)
 
         # Cache candle data to avoid refetching
         self._candle_cache: Dict[str, Dict[str, list]] = defaultdict(dict)
@@ -142,6 +164,9 @@ class CandleAnalyzer:
         """
         Run multi-timeframe analysis and produce a SwingSignal.
         """
+        # Cache raw candle data for regime classifier to use
+        self._candle_cache[symbol] = candles
+
         signal = SwingSignal(symbol=symbol, timestamp=timestamp)
 
         for tf, ohlcv in candles.items():
@@ -295,6 +320,49 @@ class CandleAnalyzer:
             )
             return
 
+        # --- Market Regime Classification ---
+        # Use primary timeframe data for regime detection
+        primary_ohlcv = signal.signals.get("4h", signal.signals.get("1h"))
+        if primary_ohlcv:
+            # Get raw arrays from the candle data stored in the analyze() method
+            # We reconstruct from the signal cache — the caller passes ohlcv data
+            pass  # Regime is computed below after we gather arrays
+
+        regime_result = self._classify_regime(signal)
+        signal.regime = regime_result.combined_regime.value
+        signal.regime_blocked = regime_result.regime_blocked
+        signal.regime_size_mult = regime_result.size_multiplier
+        signal.regime_is_breakout = regime_result.is_breakout
+        signal.regime_breakout_sl_mult = regime_result.breakout_sl_mult
+        signal.regime_adx_regime = regime_result.adx_regime.value
+        signal.regime_bb_regime = regime_result.bb_regime.value
+        signal.regime_ema_regime = regime_result.ema_regime.value
+        signal.regime_bb_width_pctl = regime_result.bb_width_pctl
+
+        if regime_result.regime_blocked:
+            signal.suggested_side = None
+            signal.confidence = 0.0
+            logger.debug(
+                f"[{signal.symbol}] Regime block: {regime_result.combined_regime.value} "
+                f"(ADX={regime_result.adx_regime.value}, BB={regime_result.bb_regime.value}, "
+                f"EMA={regime_result.ema_regime.value})"
+            )
+            return
+
+        # --- Session Filter ---
+        session_result = self._session.check(signal.symbol)
+        signal.session = session_result.session.value
+        signal.session_blocked = session_result.is_blocked
+        signal.session_size_mult = session_result.size_multiplier
+
+        if session_result.is_blocked:
+            signal.suggested_side = None
+            signal.confidence = 0.0
+            logger.debug(
+                f"[{signal.symbol}] Session block: {session_result.block_reason}"
+            )
+            return
+
         # Check alignment
         bullish_trends = {TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH}
         bearish_trends = {TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH}
@@ -376,6 +444,10 @@ class CandleAnalyzer:
                 tp_mult = self.cc.atr_tp_multiplier          # 2x ATR
                 sl_mult = self.cc.atr_sl_multiplier           # 1x ATR
 
+            # Breakout override: tighter SL (0.7x ATR)
+            if regime_result.is_breakout:
+                sl_mult *= regime_result.breakout_sl_mult
+
             raw_tp_distance = atr_source.atr * tp_mult
             raw_sl_distance = atr_source.atr * sl_mult
             raw_tp_pct = raw_tp_distance / atr_source.last_close * 100
@@ -417,6 +489,36 @@ class CandleAnalyzer:
                     f"raw_sl={raw_sl_pct:.2f}%, fees={fee_cost_pct:.2f}%)"
                 )
                 signal.suggested_side = None
+
+    # ─────────────────────────────────────────
+    # REGIME HELPER
+    # ─────────────────────────────────────────
+
+    def _classify_regime(self, signal: SwingSignal) -> RegimeResult:
+        """Run regime classification using cached OHLCV data from the signal."""
+        # We need raw candle arrays — get from _candle_cache
+        symbol = signal.symbol
+        candle_data = self._candle_cache.get(symbol, {})
+
+        # Prefer 4h for regime, fall back to 1h
+        ohlcv = candle_data.get("4h", candle_data.get("1h"))
+
+        if not ohlcv or len(ohlcv) < 20:
+            # No cached data — use ADX only for a basic regime call
+            primary_adx = signal.adx_4h if signal.adx_4h > 0 else signal.adx_1h
+            return self._regime.classify(
+                np.array([100.0]), np.array([99.0]), np.array([100.0]),
+                np.array([1000.0]), adx_value=primary_adx,
+            )
+
+        highs = np.array([c[2] for c in ohlcv], dtype=np.float64)
+        lows = np.array([c[3] for c in ohlcv], dtype=np.float64)
+        closes = np.array([c[4] for c in ohlcv], dtype=np.float64)
+        volumes = np.array([c[5] for c in ohlcv], dtype=np.float64)
+
+        primary_adx = signal.adx_4h if signal.adx_4h > 0 else signal.adx_1h
+
+        return self._regime.classify(highs, lows, closes, volumes, adx_value=primary_adx)
 
     # ─────────────────────────────────────────
     # TECHNICAL INDICATORS

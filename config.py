@@ -24,7 +24,8 @@ IDR_PER_USD = 16_300.0  # Fallback rate
 class FuturesConfig:
     """Binance Futures settings."""
     enabled: bool = True                        # Use USDT-M Futures
-    leverage: int = 30                          # 30x leverage all pairs
+    leverage: int = 10                          # 10x default (was 30x — catastrophic at low WR)
+    max_leverage: int = 15                      # Hard cap — never exceed 15x
     margin_type: str = "CROSSED"                # CROSSED (required for Multi-Assets mode)
     position_mode: str = "one-way"              # one-way or hedge
 
@@ -114,6 +115,57 @@ class CandleConfig:
 
 
 @dataclass
+class RegimeConfig:
+    """Market regime detection parameters."""
+    # ADX-based regime thresholds
+    adx_strong_trend: float = 30.0      # ADX > 30 = STRONG_TREND (full size)
+    adx_trend: float = 25.0             # ADX 25-30 = TREND (full size)
+    adx_weak: float = 20.0              # ADX 20-25 = WEAK (reduce 50%)
+    # Below 20 = RANGING (block)
+
+    # Bollinger Band Width regime
+    bb_period: int = 20
+    bb_std_dev: float = 2.0
+    bb_lookback: int = 100              # Percentile window for BB width
+    bb_expanding_pctl: float = 70.0     # >70th percentile = EXPANDING
+    bb_squeezing_pctl: float = 30.0     # <30th percentile = SQUEEZING
+
+    # Price vs EMAs choppy detection
+    ema_trend_bars: int = 5             # Price must stay on one side of all EMAs for N bars
+    ema_choppy_crosses: int = 3         # Multiple crosses in N bars = CHOPPY
+    ema_choppy_window: int = 10         # Window to count crosses
+
+    # Breakout override
+    breakout_bb_expand_pct: float = 30.0   # BB width must expand >30% in 3 candles
+    breakout_bb_candles: int = 3
+    breakout_volume_mult: float = 2.0      # Volume must be >2x average
+    breakout_sl_mult: float = 0.7          # Tighter SL: 0.7x ATR
+
+
+@dataclass
+class SessionConfig:
+    """UTC trading session windows and position sizing."""
+    enabled: bool = True
+
+    # Session windows (UTC hours): [start, end, size_mult, label]
+    # US+EU overlap: 13:00-17:00 → 100%
+    # EU session: 07:00-13:00 → 80%
+    # US session: 17:00-21:00 → 80%
+    # Asian session: 00:00-07:00 → 50% BTC/ETH only
+    # Dead zone: 21:00-00:00 → block all
+
+    # Pairs allowed in Asian session only
+    asian_allowed_pairs: List[str] = field(default_factory=lambda: [
+        "BTC/USDT", "ETH/USDT"
+    ])
+
+    # BTC/USDT allowed in all sessions
+    all_session_pairs: List[str] = field(default_factory=lambda: [
+        "BTC/USDT"
+    ])
+
+
+@dataclass
 class TradingConfig:
     """Execution and position management."""
     # --- Pairs (fixed for futures) ---
@@ -137,10 +189,17 @@ class TradingConfig:
 
     # --- Position Sizing (IDR) ---
     starting_capital_idr: float = 1_000_000  # Rp 1,000,000
-    max_position_pct: float = 0.30           # Risk 30% of equity per trade (aggressive)
+    max_position_pct: float = 0.20           # Max 20% of equity per trade (was 30%)
     max_position_usd: float = 100.0          # Will be computed from IDR
-    position_pct_of_equity: float = 0.30
+    position_pct_of_equity: float = 0.20     # Default 20% (was 30%)
+    min_position_pct: float = 0.05           # Floor: 5% of equity minimum
     max_open_positions: int = 2              # Max 2 concurrent (was 3)
+
+    # --- Kelly Criterion Position Sizing ---
+    kelly_lookback: int = 50                 # Rolling window for win rate / avg W/L ratio
+    kelly_min_trades: int = 20               # Need >= 20 trades before Kelly kicks in
+    kelly_default_pct: float = 0.10          # Conservative 10% until enough history
+    kelly_fraction: float = 0.5              # Half-Kelly for safety
 
     # --- Fee-Aware Trading ---
     fee_rate: float = 0.04                  # Binance futures taker fee per side (0.04%)
@@ -179,6 +238,21 @@ class RiskConfig:
     cooldown_after_loss_s: float = 300.0    # 5 min cooldown (was 30s)
     max_drawdown_pct: float = 25.0          # More room for swing (was 10%)
 
+    # --- Drawdown-Based Position Scaling ---
+    # Drawdown from peak equity → position size reduction
+    drawdown_scale_5: float = 1.0           # 0-5%: normal
+    drawdown_scale_10: float = 0.7          # 5-10%: reduce 30%
+    drawdown_scale_15: float = 0.4          # 10-15%: reduce 60%
+    drawdown_scale_25: float = 0.0          # 15-25%: minimum size only (floor)
+    drawdown_halt: float = 25.0             # >25%: halt all trading
+
+    # --- Consecutive Loss Adjustment ---
+    consec_loss_base: float = 0.7           # size_mult = 0.7 ^ consecutive_losses
+    consec_loss_cooldown_count: int = 3     # 3 consecutive losses → 30min cooldown
+    consec_loss_cooldown_s: float = 1800.0  # 30 minutes
+    consec_loss_halt_count: int = 4         # 4+ losses → halt pair for 2 hours
+    consec_loss_halt_s: float = 7200.0      # 2 hours
+
 
 @dataclass
 class ShadowConfig:
@@ -199,6 +273,8 @@ class BotConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     shadow: ShadowConfig = field(default_factory=ShadowConfig)
+    regime: RegimeConfig = field(default_factory=RegimeConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
     log_level: str = "INFO"
 
 

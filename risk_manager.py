@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from config import BotConfig, CONFIG
+from position_sizer import PositionSizer, SizingResult
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,9 @@ class RiskManager:
             session_start=time.time(),
         )
 
+        # Position sizer for Kelly + drawdown + consecutive loss logic
+        self.sizer = PositionSizer(config)
+
     # ─────────────────────────────────────────
     # PRE-TRADE CHECKS
     # ─────────────────────────────────────────
@@ -107,12 +111,25 @@ class RiskManager:
         if self.state.daily_trade_count >= self.rc.max_daily_trades:
             return False, f"Daily trade limit reached: {self.state.daily_trade_count}"
 
-        # Cooldown after loss
+        # Cooldown after loss — escalating based on consecutive losses
         if self.state.consecutive_losses > 0:
+            # 3+ losses: extended cooldown
+            if self.state.consecutive_losses >= self.rc.consec_loss_cooldown_count:
+                cooldown = self.rc.consec_loss_cooldown_s  # 30 min
+            else:
+                cooldown = self.rc.cooldown_after_loss_s   # 5 min default
+
             time_since_loss = time.time() - self.state.last_loss_time
-            if time_since_loss < self.rc.cooldown_after_loss_s:
-                remaining = self.rc.cooldown_after_loss_s - time_since_loss
-                return False, f"Cooldown active: {remaining:.1f}s remaining"
+            if time_since_loss < cooldown:
+                remaining = cooldown - time_since_loss
+                return False, f"Cooldown active: {remaining:.1f}s remaining ({self.state.consecutive_losses} consec losses)"
+
+        # Drawdown-based halt (separate from max_drawdown hard halt)
+        drawdown_pct = ((self.state.peak_equity - self.state.current_equity)
+                        / self.state.peak_equity * 100.0) if self.state.peak_equity > 0 else 0.0
+        if drawdown_pct >= self.rc.drawdown_halt:
+            self._halt(f"Drawdown halt: {drawdown_pct:.2f}% >= {self.rc.drawdown_halt}%")
+            return False, self.state.halt_reason
 
         return True, "OK"
 
@@ -123,32 +140,31 @@ class RiskManager:
             return False
         return True
 
-    def calculate_position_size(self, price: float) -> float:
+    def calculate_position_size(self, price: float, confidence: float = 0.55,
+                                symbol: str = "", regime_mult: float = 1.0,
+                                session_mult: float = 1.0) -> SizingResult:
         """
-        Calculate the maximum position size in base currency.
+        Calculate position size using the PositionSizer.
 
-        Uses the smaller of:
-        - max_position_usd
-        - position_pct_of_equity * current_equity
-
-        Adjusts down based on consecutive losses (risk scaling).
+        Returns a SizingResult with position_usd, leverage, notional_usd,
+        and full breakdown of all multipliers used.
         """
-        max_usd = min(
-            self.tc.max_position_usd,
-            self.state.current_equity * self.tc.position_pct_of_equity,
+        result = self.sizer.calculate(
+            equity=self.state.current_equity,
+            peak_equity=self.state.peak_equity,
+            confidence=confidence,
+            symbol=symbol,
+            regime_mult=regime_mult,
+            session_mult=session_mult,
+            current_time=time.time(),
         )
 
-        # Scale down after consecutive losses (Kelly-inspired reduction)
-        if self.state.consecutive_losses >= 2:
-            scale = max(0.25, 1.0 - (self.state.consecutive_losses * 0.2))
-            max_usd *= scale
-            logger.info(
-                f"Position scaled down to {scale:.0%} due to "
-                f"{self.state.consecutive_losses} consecutive losses"
-            )
+        # Cap at max_position_usd (hard config limit)
+        if result.position_usd > self.tc.max_position_usd:
+            result.position_usd = self.tc.max_position_usd
+            result.notional_usd = result.position_usd * result.leverage
 
-        amount = max_usd / price if price > 0 else 0.0
-        return amount
+        return result
 
     # ─────────────────────────────────────────
     # POST-TRADE UPDATES
@@ -166,9 +182,10 @@ class RiskManager:
             self.state.peak_equity = self.state.current_equity
 
         # Track consecutive losses
+        now = time.time()
         if trade.pnl_usd < 0:
             self.state.consecutive_losses += 1
-            self.state.last_loss_time = time.time()
+            self.state.last_loss_time = now
             logger.warning(
                 f"Loss recorded: ${trade.pnl_usd:.2f} | "
                 f"Consecutive losses: {self.state.consecutive_losses} | "
@@ -180,6 +197,9 @@ class RiskManager:
                 f"Win recorded: ${trade.pnl_usd:+.2f} | "
                 f"Daily PnL: ${self.state.daily_pnl:+.2f}"
             )
+
+        # Feed outcome to position sizer for Kelly + consecutive loss tracking
+        self.sizer.record_outcome(trade.symbol, trade.pnl_usd, now)
 
     # ─────────────────────────────────────────
     # STATE MANAGEMENT

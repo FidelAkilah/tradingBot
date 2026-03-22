@@ -116,7 +116,7 @@ class BotRunner:
             try:
                 from dataclasses import asdict
                 trade_dict = asdict(trade)
-                trade_dict['leverage'] = CONFIG.futures.leverage
+                trade_dict['leverage'] = trade_dict.get('leverage', CONFIG.futures.leverage)
                 if event == "OPEN":
                     db.insert_trade(trade_dict)
                 elif event == "CLOSE":
@@ -153,6 +153,12 @@ class BotRunner:
                     'adx': getattr(analysis, 'adx', 0.0),
                     'post_fee_rr': getattr(analysis, 'post_fee_rr', 0.0),
                     'adx_blocked': swing.adx_blocked if swing else False,
+                    'regime': getattr(analysis, 'regime', None),
+                    'regime_blocked': getattr(analysis, 'regime_blocked', False),
+                    'regime_is_breakout': getattr(analysis, 'regime_is_breakout', False),
+                    'session': getattr(analysis, 'session', None),
+                    'session_blocked': getattr(analysis, 'session_blocked', False),
+                    'session_size_mult': getattr(analysis, 'session_size_mult', 1.0),
                 })
             except Exception as e:
                 logger.error(f"DB signal log error: {e}")
@@ -198,6 +204,11 @@ class BotRunner:
         if self.bot and self.bot.shadow:
             result["shadow_total_pnl"] = self.bot.shadow.total_pnl
             result["shadow_open_trades"] = len(self.bot.shadow.open_trades)
+            result["shadow_equity"] = self.bot.shadow._equity
+            result["shadow_peak_equity"] = self.bot.shadow._peak_equity
+
+            # Position sizer state (Kelly stats, consecutive losses)
+            result["position_sizer"] = self.bot.shadow.sizer.get_state()
 
         return result
 

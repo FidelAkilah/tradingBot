@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 from config import BotConfig, CONFIG
 from liquidity_analyzer import AnalysisResult, LiquidityWall, WallSide
+from position_sizer import PositionSizer, SizingResult
 from risk_manager import TradeRecord
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,21 @@ class ShadowTrade:
     fee_cost_pct: float = 0.0       # Round-trip fee as % of notional
     post_fee_rr: float = 0.0        # Risk-reward ratio after fees
     adx: float = 0.0                # ADX at entry (primary timeframe)
+    # Market regime
+    regime: str = "ranging"
+    regime_size_mult: float = 1.0
+    regime_is_breakout: bool = False
+    # Session filter
+    session: str = "dead_zone"
+    session_size_mult: float = 1.0
+    # Position sizing rationale
+    leverage: int = 10
+    kelly_pct: float = 0.10
+    confidence_mult: float = 1.0
+    drawdown_mult: float = 1.0
+    drawdown_pct: float = 0.0
+    consec_loss_mult: float = 1.0
+    consecutive_losses: int = 0
     entry_time: float = 0.0
     exit_time: Optional[float] = None
     exit_price: Optional[float] = None
@@ -85,6 +101,13 @@ class ShadowTrader:
         self.open_trades: Dict[str, ShadowTrade] = {}   # key: symbol
         self.closed_trades: List[ShadowTrade] = []
         self.signal_log: List[dict] = []
+
+        # Position sizer for dynamic sizing
+        self.sizer = PositionSizer(config)
+
+        # Simulated equity tracking for sizer
+        self._equity = config.trading.starting_capital_idr / 16_300.0  # ~$61
+        self._peak_equity = self._equity
 
         # Per-symbol cooldown tracking: symbol -> time of last close
         self._last_close_time: Dict[str, float] = {}
@@ -157,23 +180,37 @@ class ShadowTrader:
 
         wall = walls[0] if walls else None
         tc = self.config.trading
-        fc = self.config.futures
         mid = analysis.mid_price
-
         entry_price = mid
 
-        leverage = fc.leverage if fc.enabled else 1
-        notional_usd = tc.max_position_usd * leverage
-        amount = notional_usd / entry_price
+        # Extract swing signal info
+        swing = getattr(analysis, 'swing', None)
+        swing_conf = swing.confidence if swing else 0.55
+        regime_size = getattr(analysis, 'regime_size_mult', 1.0)
+        session_size = getattr(analysis, 'session_size_mult', 1.0)
+
+        # Dynamic position sizing via PositionSizer
+        sizing = self.sizer.calculate(
+            equity=self._equity,
+            peak_equity=self._peak_equity,
+            confidence=swing_conf,
+            symbol=analysis.symbol,
+            regime_mult=regime_size,
+            session_mult=session_size,
+            current_time=entry_time,
+        )
+
+        if sizing.is_halted:
+            logger.info(f"[SHADOW] BUY blocked: {sizing.halt_reason}")
+            return None
+
+        amount = sizing.notional_usd / entry_price
 
         # Fee-adjusted TP/SL from analysis (already includes fee compensation)
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
         sl_pct = analysis.atr_sl_pct if analysis.atr_sl_pct > 0 else tc.stop_loss_pct
 
-        # Extract swing signal info
-        swing = getattr(analysis, 'swing', None)
         swing_trend = swing.primary_trend.value if swing else "neutral"
-        swing_conf = swing.confidence if swing else 0.0
         swing_aligned = swing.trend_aligned if swing else False
         rsi_1h = swing.rsi_1h if swing else 50.0
         rsi_4h = swing.rsi_4h if swing else 50.0
@@ -186,7 +223,7 @@ class ShadowTrader:
             target_price=entry_price * (1.0 + tp_pct / 100.0),
             stop_price=entry_price * (1.0 - sl_pct / 100.0),
             amount=amount,
-            usd_value=tc.max_position_usd,
+            usd_value=sizing.position_usd,
             wall_price=wall.price if wall else 0.0,
             wall_usd_value=wall.usd_value if wall else 0.0,
             wall_multiplier=wall.multiplier if wall else 0.0,
@@ -213,6 +250,18 @@ class ShadowTrader:
             fee_cost_pct=getattr(analysis, 'fee_cost_pct', 0.0),
             post_fee_rr=getattr(analysis, 'post_fee_rr', 0.0),
             adx=getattr(analysis, 'adx', 0.0),
+            regime=getattr(analysis, 'regime', 'ranging'),
+            regime_size_mult=regime_size,
+            regime_is_breakout=getattr(analysis, 'regime_is_breakout', False),
+            session=getattr(analysis, 'session', 'dead_zone'),
+            session_size_mult=session_size,
+            leverage=sizing.leverage,
+            kelly_pct=sizing.kelly_pct,
+            confidence_mult=sizing.confidence_mult,
+            drawdown_mult=sizing.drawdown_mult,
+            drawdown_pct=sizing.drawdown_pct,
+            consec_loss_mult=sizing.consec_loss_mult,
+            consecutive_losses=sizing.consecutive_losses,
             entry_time=entry_time,
         )
 
@@ -221,12 +270,14 @@ class ShadowTrader:
 
         logger.info(
             f"[SHADOW OPEN] BUY {trade.amount:.6f} {trade.symbol} "
-            f"@ {trade.entry_price:.2f} | wall=${trade.wall_usd_value:,.0f} "
+            f"@ {trade.entry_price:.2f} | margin=${sizing.position_usd:.2f} "
+            f"lev={sizing.leverage}x notional=${sizing.notional_usd:.2f} "
             f"| TP={trade.target_price:.2f} ({tp_pct:.2f}%) "
             f"| SL={trade.stop_price:.2f} ({sl_pct:.2f}%) "
+            f"| kelly={sizing.kelly_pct:.2f} conf_mult={sizing.confidence_mult:.1f} "
+            f"dd_mult={sizing.drawdown_mult:.1f} cl_mult={sizing.consec_loss_mult:.2f} "
             f"| trend={swing_trend} conf={swing_conf:.2f} ADX={trade.adx:.1f} "
-            f"| post-fee R:R={trade.post_fee_rr:.2f} "
-            f"| score={trade.composite_score:+.3f} | vpin={trade.vpin:.3f}"
+            f"| post-fee R:R={trade.post_fee_rr:.2f}"
         )
 
         return trade
@@ -240,21 +291,37 @@ class ShadowTrader:
 
         wall = walls[0] if walls else None
         tc = self.config.trading
-        fc = self.config.futures
         mid = analysis.mid_price
-
         entry_price = mid
 
-        leverage = fc.leverage if fc.enabled else 1
-        notional_usd = tc.max_position_usd * leverage
-        amount = notional_usd / entry_price
+        # Extract swing signal info
+        swing = getattr(analysis, 'swing', None)
+        swing_conf = swing.confidence if swing else 0.55
+        regime_size = getattr(analysis, 'regime_size_mult', 1.0)
+        session_size = getattr(analysis, 'session_size_mult', 1.0)
 
+        # Dynamic position sizing via PositionSizer
+        sizing = self.sizer.calculate(
+            equity=self._equity,
+            peak_equity=self._peak_equity,
+            confidence=swing_conf,
+            symbol=analysis.symbol,
+            regime_mult=regime_size,
+            session_mult=session_size,
+            current_time=entry_time,
+        )
+
+        if sizing.is_halted:
+            logger.info(f"[SHADOW] SELL blocked: {sizing.halt_reason}")
+            return None
+
+        amount = sizing.notional_usd / entry_price
+
+        # Fee-adjusted TP/SL from analysis (already includes fee compensation)
         tp_pct = analysis.atr_tp_pct if analysis.atr_tp_pct > 0 else tc.take_profit_pct
         sl_pct = analysis.atr_sl_pct if analysis.atr_sl_pct > 0 else tc.stop_loss_pct
 
-        swing = getattr(analysis, 'swing', None)
         swing_trend = swing.primary_trend.value if swing else "neutral"
-        swing_conf = swing.confidence if swing else 0.0
         swing_aligned = swing.trend_aligned if swing else False
         rsi_1h = swing.rsi_1h if swing else 50.0
         rsi_4h = swing.rsi_4h if swing else 50.0
@@ -267,7 +334,7 @@ class ShadowTrader:
             target_price=entry_price * (1.0 - tp_pct / 100.0),
             stop_price=entry_price * (1.0 + sl_pct / 100.0),
             amount=amount,
-            usd_value=tc.max_position_usd,
+            usd_value=sizing.position_usd,
             wall_price=wall.price if wall else 0.0,
             wall_usd_value=wall.usd_value if wall else 0.0,
             wall_multiplier=wall.multiplier if wall else 0.0,
@@ -294,6 +361,18 @@ class ShadowTrader:
             fee_cost_pct=getattr(analysis, 'fee_cost_pct', 0.0),
             post_fee_rr=getattr(analysis, 'post_fee_rr', 0.0),
             adx=getattr(analysis, 'adx', 0.0),
+            regime=getattr(analysis, 'regime', 'ranging'),
+            regime_size_mult=regime_size,
+            regime_is_breakout=getattr(analysis, 'regime_is_breakout', False),
+            session=getattr(analysis, 'session', 'dead_zone'),
+            session_size_mult=session_size,
+            leverage=sizing.leverage,
+            kelly_pct=sizing.kelly_pct,
+            confidence_mult=sizing.confidence_mult,
+            drawdown_mult=sizing.drawdown_mult,
+            drawdown_pct=sizing.drawdown_pct,
+            consec_loss_mult=sizing.consec_loss_mult,
+            consecutive_losses=sizing.consecutive_losses,
             entry_time=entry_time,
         )
 
@@ -302,12 +381,14 @@ class ShadowTrader:
 
         logger.info(
             f"[SHADOW OPEN] SELL {trade.amount:.6f} {trade.symbol} "
-            f"@ {trade.entry_price:.2f} | wall=${trade.wall_usd_value:,.0f} "
+            f"@ {trade.entry_price:.2f} | margin=${sizing.position_usd:.2f} "
+            f"lev={sizing.leverage}x notional=${sizing.notional_usd:.2f} "
             f"| TP={trade.target_price:.2f} ({tp_pct:.2f}%) "
             f"| SL={trade.stop_price:.2f} ({sl_pct:.2f}%) "
+            f"| kelly={sizing.kelly_pct:.2f} conf_mult={sizing.confidence_mult:.1f} "
+            f"dd_mult={sizing.drawdown_mult:.1f} cl_mult={sizing.consec_loss_mult:.2f} "
             f"| trend={swing_trend} conf={swing_conf:.2f} ADX={trade.adx:.1f} "
-            f"| post-fee R:R={trade.post_fee_rr:.2f} "
-            f"| score={trade.composite_score:+.3f} | vpin={trade.vpin:.3f}"
+            f"| post-fee R:R={trade.post_fee_rr:.2f}"
         )
 
         return trade
@@ -439,6 +520,14 @@ class ShadowTrader:
         else:
             self.losses += 1
 
+        # Update simulated equity for position sizer
+        self._equity += net_pnl
+        if self._equity > self._peak_equity:
+            self._peak_equity = self._equity
+
+        # Feed outcome to sizer for Kelly + consecutive loss tracking
+        self.sizer.record_outcome(trade.symbol, net_pnl, exit_time)
+
         # Move to closed and record cooldown
         del self.open_trades[trade.symbol]
         self.closed_trades.append(trade)
@@ -526,6 +615,15 @@ class ShadowTrader:
             "adx_1h": swing.adx_1h if swing else 0.0,
             "adx_4h": swing.adx_4h if swing else 0.0,
             "adx_blocked": swing.adx_blocked if swing else False,
+            # Regime
+            "regime": getattr(analysis, 'regime', 'ranging'),
+            "regime_blocked": getattr(analysis, 'regime_blocked', False),
+            "regime_size_mult": getattr(analysis, 'regime_size_mult', 1.0),
+            "regime_is_breakout": getattr(analysis, 'regime_is_breakout', False),
+            # Session
+            "session": getattr(analysis, 'session', 'dead_zone'),
+            "session_blocked": getattr(analysis, 'session_blocked', False),
+            "session_size_mult": getattr(analysis, 'session_size_mult', 1.0),
         }
         try:
             with open(self._signal_log_path, "a") as f:

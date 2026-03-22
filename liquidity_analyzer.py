@@ -121,6 +121,15 @@ class AnalysisResult:
     fee_cost_pct: float = 0.0             # Round-trip fee as % of notional
     post_fee_rr: float = 0.0              # Risk-reward ratio after fees
     adx: float = 0.0                       # Primary ADX value
+    # Market regime
+    regime: str = "ranging"                # Combined regime label
+    regime_blocked: bool = False
+    regime_size_mult: float = 1.0
+    regime_is_breakout: bool = False
+    # Session filter
+    session: str = "dead_zone"
+    session_blocked: bool = False
+    session_size_mult: float = 1.0
 
 
 # ─────────────────────────────────────────────
@@ -221,6 +230,15 @@ class LiquidityAnalyzer:
             swing_signal.adx_1h if swing_signal else 0.0
         )
 
+        # Regime and session from swing signal
+        regime_val = swing_signal.regime if swing_signal else "ranging"
+        regime_blocked = swing_signal.regime_blocked if swing_signal else False
+        regime_size_mult = swing_signal.regime_size_mult if swing_signal else 1.0
+        regime_is_breakout = swing_signal.regime_is_breakout if swing_signal else False
+        session_val = swing_signal.session if swing_signal else "dead_zone"
+        session_blocked = swing_signal.session_blocked if swing_signal else False
+        session_size_mult = swing_signal.session_size_mult if swing_signal else 1.0
+
         result = AnalysisResult(
             symbol=symbol,
             timestamp=timestamp,
@@ -242,6 +260,13 @@ class LiquidityAnalyzer:
             fee_cost_pct=fee_cost,
             post_fee_rr=post_fee_rr,
             adx=adx_val,
+            regime=regime_val,
+            regime_blocked=regime_blocked,
+            regime_size_mult=regime_size_mult,
+            regime_is_breakout=regime_is_breakout,
+            session=session_val,
+            session_blocked=session_blocked,
+            session_size_mult=session_size_mult,
         )
 
         self._result_history[symbol].append(result)
