@@ -210,6 +210,10 @@ class BotRunner:
             # Position sizer state (Kelly stats, consecutive losses)
             result["position_sizer"] = self.bot.shadow.sizer.get_state()
 
+        # Daily target progress
+        if self.bot and hasattr(self.bot, 'daily_target'):
+            result["daily_target"] = self.bot.daily_target.get_daily_progress()
+
         return result
 
 
@@ -428,6 +432,148 @@ async def stop_bot():
         raise HTTPException(400, "Bot is not running")
     await bot_runner.stop()
     return {"message": "Bot stopped", "status": bot_runner.status}
+
+
+@app.get("/api/daily-target")
+async def get_daily_target():
+    """Daily target progress, mode, and compound tracking."""
+    result = {}
+
+    if bot_runner.bot and hasattr(bot_runner.bot, 'daily_target'):
+        result["progress"] = bot_runner.bot.daily_target.get_daily_progress()
+        result["projection_30d"] = bot_runner.bot.compounder.get_compound_projection(30)
+    else:
+        result["progress"] = None
+        result["projection_30d"] = []
+
+    return _sanitize_floats(result)
+
+
+@app.get("/api/daily-equity")
+async def get_daily_equity(limit: int = Query(90, ge=1, le=365)):
+    """Daily equity history for compound growth chart."""
+    history = db.get_daily_equity(limit=limit)
+    summary = db.get_daily_equity_summary()
+    return _sanitize_floats({
+        "history": history,
+        "summary": summary,
+    })
+
+
+@app.get("/api/correlation")
+async def get_correlation():
+    """Correlation matrix heat map + guard status."""
+    result = {"matrix": {}, "pairs": CONFIG.trading.manual_pairs, "stale": True}
+
+    if bot_runner.bot and hasattr(bot_runner.bot, 'corr_matrix'):
+        cm = bot_runner.bot.corr_matrix
+        if not cm.is_stale():
+            result["stale"] = False
+        result["matrix"] = cm.get_matrix_dict()
+
+        # Flag highly correlated open positions
+        correlated_positions = []
+        if bot_runner.bot.shadow:
+            open_syms = list(bot_runner.bot.shadow.open_trades.keys())
+            for i, s1 in enumerate(open_syms):
+                for s2 in open_syms[i + 1:]:
+                    corr = cm.get_correlation(s1, s2)
+                    if corr is not None:
+                        t1 = bot_runner.bot.shadow.open_trades[s1]
+                        t2 = bot_runner.bot.shadow.open_trades[s2]
+                        correlated_positions.append({
+                            "pair": [s1, s2],
+                            "correlation": round(corr, 4),
+                            "same_direction": t1.side == t2.side,
+                            "high_corr": abs(corr) >= CONFIG.correlation.high_corr_threshold,
+                        })
+        result["correlated_positions"] = correlated_positions
+
+    return _sanitize_floats(result)
+
+
+@app.get("/api/exposure")
+async def get_exposure():
+    """Portfolio directional exposure and heat map."""
+    result = {
+        "net_long": 0.0, "net_short": 0.0, "net_exposure": 0.0,
+        "gross_exposure": 0.0, "directional_bias": "neutral",
+        "max_long": CONFIG.correlation.max_net_long_exposure,
+        "max_short": CONFIG.correlation.max_net_short_exposure,
+        "positions": [],
+        "breach_long": False, "breach_short": False,
+    }
+
+    if bot_runner.bot and hasattr(bot_runner.bot, 'portfolio_heat'):
+        from main import ScalpingBot
+        open_info = bot_runner.bot._get_open_positions_info()
+        equity = 0.0
+        if bot_runner.bot.shadow:
+            equity = bot_runner.bot.shadow._equity
+        elif bot_runner.bot.risk:
+            equity = bot_runner.bot.risk.state.current_equity
+
+        if open_info and equity > 0:
+            exposure = bot_runner.bot.portfolio_heat.compute_exposure(open_info, equity)
+            result.update({
+                "net_long": exposure.net_long_exposure,
+                "net_short": exposure.net_short_exposure,
+                "net_exposure": exposure.net_exposure,
+                "gross_exposure": exposure.gross_exposure,
+                "directional_bias": exposure.directional_bias,
+                "breach_long": exposure.breach_long,
+                "breach_short": exposure.breach_short,
+                "positions": exposure.positions,
+            })
+
+    return _sanitize_floats(result)
+
+
+@app.get("/api/scanner")
+async def get_scanner():
+    """Scanner results — pair scores, selections, and reasons."""
+    result = {"status": "disabled", "pairs": CONFIG.trading.manual_pairs}
+
+    if not CONFIG.scanner.enabled:
+        return result
+
+    if bot_runner.bot and hasattr(bot_runner.bot, 'pair_selector'):
+        result = bot_runner.bot.pair_selector.get_scan_summary()
+        result["status"] = "active"
+    else:
+        # Try loading from bot_state
+        try:
+            cached = db.get_state("last_scan")
+            if cached:
+                result = cached
+                result["status"] = "cached"
+        except Exception:
+            pass
+
+    return _sanitize_floats(result)
+
+
+@app.get("/api/scanner/performance")
+async def get_scanner_performance():
+    """Per-pair performance stats — win rates, P&L, auto-disable flags."""
+    result = {"pairs": [], "disabled_count": 0, "auto_include_count": 0}
+
+    if bot_runner.bot and hasattr(bot_runner.bot, 'pair_performance'):
+        result = bot_runner.bot.pair_performance.get_summary()
+
+    return _sanitize_floats(result)
+
+
+@app.post("/api/scanner/scan")
+async def trigger_scan():
+    """Trigger an on-demand pair scan."""
+    if not CONFIG.scanner.enabled:
+        raise HTTPException(400, "Scanner is disabled")
+    if not bot_runner.bot:
+        raise HTTPException(400, "Bot is not running")
+
+    await bot_runner.bot._run_pair_scan()
+    return _sanitize_floats(bot_runner.bot.pair_selector.get_scan_summary())
 
 
 @app.get("/health")

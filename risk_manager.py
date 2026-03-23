@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from config import BotConfig, CONFIG
+from daily_target.tracker import DailyTargetContext
 from position_sizer import PositionSizer, SizingResult
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,8 @@ class RiskManager:
 
     def calculate_position_size(self, price: float, confidence: float = 0.55,
                                 symbol: str = "", regime_mult: float = 1.0,
-                                session_mult: float = 1.0) -> SizingResult:
+                                session_mult: float = 1.0,
+                                daily_target_ctx: Optional[DailyTargetContext] = None) -> SizingResult:
         """
         Calculate position size using the PositionSizer.
 
@@ -156,6 +158,7 @@ class RiskManager:
             symbol=symbol,
             regime_mult=regime_mult,
             session_mult=session_mult,
+            daily_target_ctx=daily_target_ctx,
             current_time=time.time(),
         )
 

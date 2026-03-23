@@ -26,6 +26,9 @@ def config():
     cfg.candle.adx_period = 14
     cfg.candle.adx_trending_threshold = 25.0
     cfg.candle.adx_ranging_threshold = 20.0
+    # Disable features not under test to avoid interference
+    cfg.candle.divergence_enabled = False
+    cfg.candle.patterns_enabled = False
     return cfg
 
 

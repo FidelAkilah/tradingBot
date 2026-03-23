@@ -85,10 +85,29 @@ def init_db():
         updated_at REAL
     );
 
+    CREATE TABLE IF NOT EXISTS daily_equity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT UNIQUE NOT NULL,
+        open_equity REAL,
+        close_equity REAL,
+        target_pct REAL,
+        actual_pct REAL,
+        target_hit INTEGER DEFAULT 0,
+        realized_pnl REAL,
+        trades INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        streak INTEGER DEFAULT 0,
+        miss_streak INTEGER DEFAULT 0,
+        mode_at_close TEXT,
+        created_at REAL DEFAULT (strftime('%s','now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_open ON trades(is_open);
     CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time);
     CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_daily_equity_date ON daily_equity(date);
     """)
     conn.commit()
 
@@ -113,6 +132,36 @@ def init_db():
         "drawdown_pct": "REAL",
         "consec_loss_mult": "REAL",
         "consecutive_losses": "INTEGER",
+        # Partial TP columns
+        "tp1_hit": "INTEGER",
+        "tp1_price": "REAL",
+        "tp1_pnl": "REAL",
+        "tp2_hit": "INTEGER",
+        "tp2_price": "REAL",
+        "tp2_pnl": "REAL",
+        "tp3_hit": "INTEGER",
+        "tp3_price": "REAL",
+        "tp3_pnl": "REAL",
+        "original_amount": "REAL",
+        "atr_at_entry": "REAL",
+        "partial_realized_pnl": "REAL",
+        "partial_fees": "REAL",
+        "max_favorable_price": "REAL",
+        # Re-entry tracking
+        "is_reentry": "INTEGER",
+        "reentry_count": "INTEGER",
+    })
+    _migrate_add_columns(conn, "trades", {
+        # Volume analysis columns
+        "obv_trend": "TEXT",
+        "obv_divergence": "INTEGER",
+        "volume_pressure": "TEXT",
+        "buy_volume_ratio": "REAL",
+        "poc_price": "REAL",
+        "funding_rate": "REAL",
+        "funding_extreme": "INTEGER",
+        "oi_change_pct": "REAL",
+        "oi_conviction": "TEXT",
     })
     _migrate_add_columns(conn, "signals", {
         "adx": "REAL",
@@ -124,6 +173,15 @@ def init_db():
         "session": "TEXT",
         "session_blocked": "INTEGER",
         "session_size_mult": "REAL",
+        # Volume/Funding/OI signal columns
+        "obv_trend": "TEXT",
+        "obv_divergence": "INTEGER",
+        "volume_pressure": "TEXT",
+        "buy_volume_ratio": "REAL",
+        "funding_rate": "REAL",
+        "funding_extreme": "INTEGER",
+        "oi_change_pct": "REAL",
+        "oi_conviction": "TEXT",
     })
 
 
@@ -158,6 +216,19 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         # Position sizing columns
         'kelly_pct', 'confidence_mult', 'drawdown_mult',
         'drawdown_pct', 'consec_loss_mult', 'consecutive_losses',
+        # Partial TP columns
+        'tp1_hit', 'tp1_price', 'tp1_pnl',
+        'tp2_hit', 'tp2_price', 'tp2_pnl',
+        'tp3_hit', 'tp3_price', 'tp3_pnl',
+        'original_amount', 'atr_at_entry', 'partial_realized_pnl',
+        'partial_fees', 'max_favorable_price',
+        # Re-entry tracking
+        'is_reentry', 'reentry_count',
+        # Volume/Funding/OI
+        'obv_trend', 'obv_divergence', 'volume_pressure',
+        'buy_volume_ratio', 'poc_price',
+        'funding_rate', 'funding_extreme',
+        'oi_change_pct', 'oi_conviction',
     }
     extra = {k: v for k, v in trade_data.items() if k not in known_cols}
 
@@ -174,6 +245,16 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         session, session_size_mult,
         kelly_pct, confidence_mult, drawdown_mult,
         drawdown_pct, consec_loss_mult, consecutive_losses,
+        tp1_hit, tp1_price, tp1_pnl,
+        tp2_hit, tp2_price, tp2_pnl,
+        tp3_hit, tp3_price, tp3_pnl,
+        original_amount, atr_at_entry, partial_realized_pnl,
+        partial_fees, max_favorable_price,
+        is_reentry, reentry_count,
+        obv_trend, obv_divergence, volume_pressure,
+        buy_volume_ratio, poc_price,
+        funding_rate, funding_extreme,
+        oi_change_pct, oi_conviction,
         extra_json
     ) VALUES (
         :trade_id, :symbol, :side, :entry_price, :exit_price, :target_price,
@@ -187,6 +268,16 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         :session, :session_size_mult,
         :kelly_pct, :confidence_mult, :drawdown_mult,
         :drawdown_pct, :consec_loss_mult, :consecutive_losses,
+        :tp1_hit, :tp1_price, :tp1_pnl,
+        :tp2_hit, :tp2_price, :tp2_pnl,
+        :tp3_hit, :tp3_price, :tp3_pnl,
+        :original_amount, :atr_at_entry, :partial_realized_pnl,
+        :partial_fees, :max_favorable_price,
+        :is_reentry, :reentry_count,
+        :obv_trend, :obv_divergence, :volume_pressure,
+        :buy_volume_ratio, :poc_price,
+        :funding_rate, :funding_extreme,
+        :oi_change_pct, :oi_conviction,
         :extra_json
     )
     """, {
@@ -232,6 +323,31 @@ def insert_trade(trade_data: Dict[str, Any]) -> int:
         'drawdown_pct': trade_data.get('drawdown_pct'),
         'consec_loss_mult': trade_data.get('consec_loss_mult'),
         'consecutive_losses': trade_data.get('consecutive_losses'),
+        'tp1_hit': 1 if trade_data.get('tp1_hit') else 0,
+        'tp1_price': trade_data.get('tp1_price'),
+        'tp1_pnl': trade_data.get('tp1_pnl'),
+        'tp2_hit': 1 if trade_data.get('tp2_hit') else 0,
+        'tp2_price': trade_data.get('tp2_price'),
+        'tp2_pnl': trade_data.get('tp2_pnl'),
+        'tp3_hit': 1 if trade_data.get('tp3_hit') else 0,
+        'tp3_price': trade_data.get('tp3_price'),
+        'tp3_pnl': trade_data.get('tp3_pnl'),
+        'original_amount': trade_data.get('original_amount'),
+        'atr_at_entry': trade_data.get('atr_at_entry'),
+        'partial_realized_pnl': trade_data.get('partial_realized_pnl'),
+        'partial_fees': trade_data.get('partial_fees'),
+        'max_favorable_price': trade_data.get('max_favorable_price'),
+        'is_reentry': 1 if trade_data.get('is_reentry') else 0,
+        'reentry_count': trade_data.get('reentry_count', 0),
+        'obv_trend': trade_data.get('obv_trend'),
+        'obv_divergence': 1 if trade_data.get('obv_divergence') else 0,
+        'volume_pressure': trade_data.get('volume_pressure'),
+        'buy_volume_ratio': trade_data.get('buy_volume_ratio'),
+        'poc_price': trade_data.get('poc_price'),
+        'funding_rate': trade_data.get('funding_rate'),
+        'funding_extreme': 1 if trade_data.get('funding_extreme') else 0,
+        'oi_change_pct': trade_data.get('oi_change_pct'),
+        'oi_conviction': trade_data.get('oi_conviction'),
         'extra_json': json.dumps(extra, default=str) if extra else None,
     })
     conn.commit()
@@ -319,6 +435,10 @@ def insert_signal(signal_data: Dict[str, Any]):
         'adx', 'post_fee_rr', 'adx_blocked',
         'regime', 'regime_blocked', 'regime_is_breakout',
         'session', 'session_blocked', 'session_size_mult',
+        # Volume/Funding/OI
+        'obv_trend', 'obv_divergence', 'volume_pressure',
+        'buy_volume_ratio', 'funding_rate', 'funding_extreme',
+        'oi_change_pct', 'oi_conviction',
     }
     extra = {k: v for k, v in signal_data.items() if k not in known_cols}
     conn.execute("""
@@ -328,8 +448,11 @@ def insert_signal(signal_data: Dict[str, Any]):
         atr_tp_pct, atr_sl_pct, adx, post_fee_rr, adx_blocked,
         regime, regime_blocked, regime_is_breakout,
         session, session_blocked, session_size_mult,
+        obv_trend, obv_divergence, volume_pressure,
+        buy_volume_ratio, funding_rate, funding_extreme,
+        oi_change_pct, oi_conviction,
         extra_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal_data.get('timestamp'),
         signal_data.get('symbol'),
@@ -351,6 +474,14 @@ def insert_signal(signal_data: Dict[str, Any]):
         signal_data.get('session'),
         1 if signal_data.get('session_blocked') else 0,
         signal_data.get('session_size_mult'),
+        signal_data.get('obv_trend'),
+        1 if signal_data.get('obv_divergence') else 0,
+        signal_data.get('volume_pressure'),
+        signal_data.get('buy_volume_ratio'),
+        signal_data.get('funding_rate'),
+        1 if signal_data.get('funding_extreme') else 0,
+        signal_data.get('oi_change_pct'),
+        signal_data.get('oi_conviction'),
         json.dumps(extra, default=str) if extra else None,
     ))
     conn.commit()
@@ -477,3 +608,83 @@ def get_pnl_timeseries() -> List[dict]:
         ORDER BY exit_time
     """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────
+# DAILY EQUITY (compound tracking)
+# ─────────────────────────────────────────
+
+def insert_daily_equity(summary: Dict[str, Any]):
+    """Record a daily equity snapshot (called at day rollover)."""
+    conn = get_conn()
+    conn.execute("""
+    INSERT OR REPLACE INTO daily_equity (
+        date, open_equity, close_equity, target_pct, actual_pct,
+        target_hit, realized_pnl, trades, wins, losses,
+        streak, miss_streak, mode_at_close
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        summary.get('date'),
+        summary.get('open_equity'),
+        summary.get('close_equity'),
+        summary.get('target_pct'),
+        summary.get('actual_pct'),
+        1 if summary.get('target_hit') else 0,
+        summary.get('realized_pnl'),
+        summary.get('trades', 0),
+        summary.get('wins', 0),
+        summary.get('losses', 0),
+        summary.get('streak', 0),
+        summary.get('miss_streak', 0),
+        summary.get('mode_at_close'),
+    ))
+    conn.commit()
+
+
+def get_daily_equity(limit: int = 90) -> List[dict]:
+    """Get daily equity history for compound growth chart."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT * FROM daily_equity
+        ORDER BY date DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_daily_equity_summary() -> dict:
+    """Aggregate daily equity stats."""
+    conn = get_conn()
+    total_days = conn.execute(
+        "SELECT COUNT(*) as c FROM daily_equity"
+    ).fetchone()["c"]
+    hit_days = conn.execute(
+        "SELECT COUNT(*) as c FROM daily_equity WHERE target_hit = 1"
+    ).fetchone()["c"]
+    max_streak = conn.execute(
+        "SELECT COALESCE(MAX(streak), 0) as m FROM daily_equity"
+    ).fetchone()["m"]
+
+    first = conn.execute(
+        "SELECT open_equity FROM daily_equity ORDER BY date ASC LIMIT 1"
+    ).fetchone()
+    last = conn.execute(
+        "SELECT close_equity FROM daily_equity ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+
+    start_equity = first["open_equity"] if first else 0
+    end_equity = last["close_equity"] if last else 0
+    total_return_pct = (
+        (end_equity - start_equity) / start_equity * 100.0
+        if start_equity > 0 else 0.0
+    )
+
+    return {
+        "total_days": total_days,
+        "target_hit_days": hit_days,
+        "hit_rate_pct": (hit_days / total_days * 100.0) if total_days > 0 else 0.0,
+        "max_streak": max_streak,
+        "start_equity": start_equity,
+        "end_equity": end_equity,
+        "total_return_pct": round(total_return_pct, 2),
+    }

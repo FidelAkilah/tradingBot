@@ -1,23 +1,30 @@
 """
-Position Sizer — Dynamic position sizing using Kelly Criterion.
+Position Sizer — Daily-target-aware position sizing using Kelly Criterion.
 
 Combines multiple sizing signals into a single position size:
 1. Kelly Criterion (rolling win rate + avg W/L ratio, half-Kelly)
 2. Confidence-weighted multiplier
-3. Drawdown-based scaling
-4. Consecutive loss exponential reduction
-5. Dynamic leverage based on confidence
+3. Overall drawdown-based scaling (from peak equity)
+4. Intraday drawdown scaling (from day-open equity, tighter thresholds)
+5. Consecutive loss exponential reduction
+6. Target progress multiplier (behind-schedule boost, target-achieved reduction)
+7. Dynamic leverage based on confidence AND daily progress
 
-Position size = kelly_pct * confidence_mult * drawdown_mult * consec_loss_mult * equity
-Leverage = confidence-mapped value (5x to 12x, hard cap 15x)
+Position size = kelly_pct * confidence_mult * drawdown_mult * intraday_dd_mult
+               * consec_loss_mult * regime_mult * session_mult * target_progress_mult
+               * equity
+
+Leverage = confidence-mapped value (5x to 20x), reduced 40% after target hit.
+Hard cap 20x.
 """
 
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 from config import BotConfig, CONFIG
+from daily_target.tracker import DailyTargetContext, TradingMode
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +38,17 @@ class SizingResult:
 
     # Component breakdown (for logging)
     kelly_fraction: float = 0.0        # Raw Kelly f
-    kelly_pct: float = 0.10            # Half-Kelly (or default)
+    kelly_pct: float = 0.15            # Half-Kelly (or default)
     confidence_mult: float = 1.0
     drawdown_mult: float = 1.0
     drawdown_pct: float = 0.0
+    intraday_dd_mult: float = 1.0
+    intraday_dd_pct: float = 0.0
     consec_loss_mult: float = 1.0
     consecutive_losses: int = 0
     regime_mult: float = 1.0
     session_mult: float = 1.0
+    target_progress_mult: float = 1.0
 
     # Flags
     is_halted: bool = False
@@ -55,10 +65,13 @@ class SizingResult:
             "confidence_mult": round(self.confidence_mult, 4),
             "drawdown_mult": round(self.drawdown_mult, 4),
             "drawdown_pct": round(self.drawdown_pct, 4),
+            "intraday_dd_mult": round(self.intraday_dd_mult, 4),
+            "intraday_dd_pct": round(self.intraday_dd_pct, 4),
             "consec_loss_mult": round(self.consec_loss_mult, 4),
             "consecutive_losses": self.consecutive_losses,
             "regime_mult": round(self.regime_mult, 4),
             "session_mult": round(self.session_mult, 4),
+            "target_progress_mult": round(self.target_progress_mult, 4),
             "is_halted": self.is_halted,
             "halt_reason": self.halt_reason,
             "used_kelly": self.used_kelly,
@@ -75,7 +88,8 @@ class TradeOutcome:
 class PositionSizer:
     """
     Computes dynamic position sizes combining Kelly Criterion with
-    confidence weighting, drawdown scaling, and consecutive loss adjustment.
+    confidence weighting, drawdown scaling, consecutive loss adjustment,
+    and daily-target-aware leverage and sizing.
     """
 
     def __init__(self, config: BotConfig = CONFIG):
@@ -103,6 +117,7 @@ class PositionSizer:
         symbol: str = "",
         regime_mult: float = 1.0,
         session_mult: float = 1.0,
+        daily_target_ctx: Optional[DailyTargetContext] = None,
         current_time: float = 0.0,
     ) -> SizingResult:
         """
@@ -115,6 +130,7 @@ class PositionSizer:
             symbol: Trading pair (for per-symbol consecutive loss tracking)
             regime_mult: Regime-based size multiplier (from market_regime)
             session_mult: Session-based size multiplier (from session_filter)
+            daily_target_ctx: Daily target context (leverage/sizing adjustments)
             current_time: Current timestamp for halt checking
 
         Returns:
@@ -143,32 +159,55 @@ class PositionSizer:
         # 2. Confidence multiplier
         result.confidence_mult = self._confidence_multiplier(confidence)
 
-        # 3. Drawdown scaling
+        # 3. Overall drawdown scaling (from peak equity)
         result.drawdown_pct = self._drawdown_pct(equity, peak_equity)
         result.drawdown_mult = self._drawdown_multiplier(result.drawdown_pct)
 
-        # Check drawdown halt
+        # Check overall drawdown halt
         if result.drawdown_pct >= self.rc.drawdown_halt:
             result.is_halted = True
             result.halt_reason = f"Drawdown {result.drawdown_pct:.1f}% >= {self.rc.drawdown_halt}% halt"
             return result
 
-        # 4. Consecutive loss scaling
+        # 4. Intraday drawdown scaling (from day-open equity)
+        if daily_target_ctx is not None:
+            result.intraday_dd_pct = daily_target_ctx.intraday_dd_pct
+            result.intraday_dd_mult = self._intraday_drawdown_multiplier(
+                result.intraday_dd_pct
+            )
+            # Check intraday halt
+            if result.intraday_dd_pct >= self.rc.intraday_dd_halt:
+                result.is_halted = True
+                result.halt_reason = (
+                    f"Intraday drawdown {result.intraday_dd_pct:.1f}% "
+                    f">= {self.rc.intraday_dd_halt}% halt"
+                )
+                return result
+
+        # 5. Consecutive loss scaling
         consec = self._consecutive_losses.get(symbol, 0)
         result.consecutive_losses = consec
         result.consec_loss_mult = self._consecutive_loss_multiplier(consec)
 
-        # 5. Dynamic leverage
-        result.leverage = self._dynamic_leverage(confidence)
+        # 6. Target progress multiplier
+        result.target_progress_mult = self._target_progress_multiplier(
+            daily_target_ctx, confidence
+        )
 
-        # 6. Combine all multipliers
+        # 7. Dynamic leverage (target-aware)
+        target_hit = daily_target_ctx.target_hit if daily_target_ctx else False
+        result.leverage = self._dynamic_leverage(confidence, target_hit)
+
+        # 8. Combine all multipliers
         base_pct = kelly_pct  # Already half-Kelly or default
         combined_mult = (
             result.confidence_mult
             * result.drawdown_mult
+            * result.intraday_dd_mult
             * result.consec_loss_mult
             * regime_mult
             * session_mult
+            * result.target_progress_mult
         )
 
         position_pct = base_pct * combined_mult
@@ -284,33 +323,42 @@ class PositionSizer:
         return 0.6  # 0.55-0.65
 
     # ─────────────────────────────────────────
-    # DYNAMIC LEVERAGE
+    # DYNAMIC LEVERAGE (target-aware)
     # ─────────────────────────────────────────
 
-    def _dynamic_leverage(self, confidence: float) -> int:
+    def _dynamic_leverage(self, confidence: float, target_hit: bool = False) -> int:
         """
-        Map confidence score to leverage level.
+        Map confidence score to leverage level with interpolation.
 
-        0.55-0.65: 5x
-        0.65-0.75: 8x
-        0.75-0.85: 10x
-        0.85+:     12x
+        Before target hit:
+            0.55-0.65: 5x → 8x
+            0.65-0.75: 8x → 12x
+            0.75-0.85: 12x → 16x
+            0.85+:     16x → 20x
 
-        Never exceeds max_leverage (default 15x).
+        After target hit: ALL tiers reduce by 40%.
+        Hard cap: max_leverage (default 20x).
         """
         if confidence >= 0.85:
-            lev = 12
+            t = min((confidence - 0.85) / 0.15, 1.0)
+            lev = 16.0 + t * 4.0    # 16 → 20
         elif confidence >= 0.75:
-            lev = 10
+            t = (confidence - 0.75) / 0.10
+            lev = 12.0 + t * 4.0    # 12 → 16
         elif confidence >= 0.65:
-            lev = 8
+            t = (confidence - 0.65) / 0.10
+            lev = 8.0 + t * 4.0     # 8 → 12
         else:
-            lev = 5
+            t = max((confidence - 0.55) / 0.10, 0.0)
+            lev = 5.0 + t * 3.0     # 5 → 8
 
-        return min(lev, self.fc.max_leverage)
+        if target_hit:
+            lev *= 0.6  # 40% reduction after target achieved
+
+        return max(1, min(round(lev), self.fc.max_leverage))
 
     # ─────────────────────────────────────────
-    # DRAWDOWN SCALING
+    # OVERALL DRAWDOWN SCALING (from peak)
     # ─────────────────────────────────────────
 
     @staticmethod
@@ -336,6 +384,63 @@ class PositionSizer:
         if dd_pct < 15.0:
             return self.rc.drawdown_scale_15
         return self.rc.drawdown_scale_25  # 0.0 → will be floored to min
+
+    # ─────────────────────────────────────────
+    # INTRADAY DRAWDOWN SCALING (from day-open)
+    # ─────────────────────────────────────────
+
+    def _intraday_drawdown_multiplier(self, dd_pct: float) -> float:
+        """
+        Scale position size based on intraday drawdown from day-open equity.
+        Tighter thresholds than overall drawdown for compounding protection.
+
+        0-3%:   1.0 (normal)
+        3-5%:   0.7 (reduce 30%)
+        5-7%:   0.4 (reduce 60%)
+        >=7%:   halted (handled in calculate())
+        """
+        if dd_pct < 3.0:
+            return self.rc.intraday_dd_scale_3
+        if dd_pct < 5.0:
+            return self.rc.intraday_dd_scale_5
+        if dd_pct < 7.0:
+            return self.rc.intraday_dd_scale_7
+        return 0.0  # Will be caught by halt check before reaching here
+
+    # ─────────────────────────────────────────
+    # TARGET PROGRESS MULTIPLIER
+    # ─────────────────────────────────────────
+
+    def _target_progress_multiplier(
+        self,
+        ctx: Optional[DailyTargetContext],
+        confidence: float,
+    ) -> float:
+        """
+        Adjust sizing based on daily target progress.
+
+        - HALTED mode: 0.0 (no new trades)
+        - Target achieved (>=100%): 0.5x (protect gains)
+        - PROTECTING mode: protecting_size_mult (0.6x)
+        - Behind schedule + high confidence (>0.70): 1.3x (concentrate on best signals)
+        - Normal: 1.0
+        """
+        if ctx is None:
+            return 1.0
+
+        if ctx.mode == TradingMode.HALTED:
+            return 0.0
+
+        if ctx.target_hit:
+            return 0.5
+
+        if ctx.mode == TradingMode.PROTECTING:
+            return self.config.daily_target.protecting_size_mult  # 0.60
+
+        if ctx.behind_schedule and confidence >= 0.70:
+            return 1.3
+
+        return 1.0
 
     # ─────────────────────────────────────────
     # CONSECUTIVE LOSS SCALING
