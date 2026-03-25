@@ -1,15 +1,30 @@
 # CLAUDE.md — Binance USDT-M Futures Swing Trading Bot
 
 ## What This Is
-IDR-denominated swing trading bot for Binance USDT-M Futures. Multi-timeframe candle analysis (1d/4h/1h/15m) drives primary signals; candlestick patterns, RSI divergences, S/R levels, order book liquidity, enhanced volume analysis (OBV/buy-sell/volume profile), funding rate filtering, open interest analysis, MACD momentum confirmation, BB squeeze + Keltner Channel breakout detection, cross-pair correlation guard with portfolio exposure management, and dynamic pair scanning with opportunity scoring filter and confirm entries. Shadow (paper) mode by default, live mode with `--live`. Daily compound profit targeting with 4 trading modes. Partial take-profit scale-out with Chandelier trailing stop and smart re-entry after stop-outs. Opportunity scanner rotates to highest-scoring pairs every 2 hours with per-pair performance tracking.
+IDR-denominated swing trading bot for Binance USDT-M Futures. Multi-timeframe candle analysis (1d/4h/1h/15m) drives primary signals; candlestick patterns, RSI divergences, S/R levels, order book liquidity, enhanced volume analysis (OBV/buy-sell/volume profile), funding rate filtering, open interest analysis, MACD momentum confirmation, BB squeeze + Keltner Channel breakout detection, cross-pair correlation guard with portfolio exposure management, and dynamic pair scanning with opportunity scoring filter and confirm entries. Shadow (paper) mode by default, live mode with `--live`. Daily compound profit targeting with 4 trading modes. Partial take-profit scale-out with Chandelier trailing stop and smart re-entry after stop-outs. Opportunity scanner rotates to highest-scoring pairs every 2 hours with per-pair performance tracking. AI knowledge ingestion pipeline (YouTube, papers, blogs) with LLM-based extraction and a pre-trade AI advisor that consults the knowledge base and provides post-trade feedback loop for reinforcement learning.
 
 ## Quick Commands
 ```bash
-python -m pytest tests/ -v          # Run all tests (608 total)
+python -m pytest tests/ -v          # Run all tests (729 total)
 python main.py                      # Shadow mode
 python main.py --live               # Live on testnet
 python server.py                    # FastAPI + bot (dashboard at :3000)
 bash start.sh                       # Full stack (server + Next.js dashboard)
+
+# Backtester
+python -m backtester sync-data --days 90                                          # Download historical data
+python -m backtester run --start 2025-01-01 --end 2025-03-20                      # Run backtest
+python -m backtester optimize --param atr_tp_multiplier --range 1.5,3.0,0.25 --start 2025-01-01 --end 2025-03-20  # Param sweep
+python -m backtester report --run-id <id>                                          # Generate HTML report
+python -m backtester status                                                        # Show data sync status
+python -m backtester list-params                                                   # List optimizable parameters
+
+# AI Learning Pipeline
+python -m ai_learning ingest-youtube <url>       # Ingest YouTube video transcript
+python -m ai_learning ingest-paper <url>         # Ingest paper/blog/PDF
+python -m ai_learning sync-sources               # Check all monitored sources for new content
+python -m ai_learning search <query>             # Search knowledge base
+python -m ai_learning stats                      # Show KB statistics
 ```
 
 ## Architecture Overview
@@ -32,8 +47,10 @@ main.py (ScalpingBot orchestrator)
 ├── risk_manager.py          → RiskManager (daily loss/drawdown/cooldown)
 ├── daily_target/            → DailyTargetTracker + ModeController + Compounder
 ├── scanner/                 → OpportunityScanner + PairSelector + PairPerformanceTracker
+├── backtester/              → Backtesting framework (data, engine, metrics, optimizer, report)
+├── ai_learning/             → Knowledge ingestion pipeline (YouTube, papers, blogs, LLM extraction, vector search) + TradingAdvisor (pre-trade consultation, post-trade feedback loop)
 ├── database.py              → SQLite (trades, signals, daily_equity, bot_state)
-└── config.py                → BotConfig (all dataclass configs incl. VolumeConfig, ExitConfig, ReentryConfig, CorrelationConfig, ScannerConfig)
+└── config.py                → BotConfig (all dataclass configs incl. VolumeConfig, ExitConfig, ReentryConfig, CorrelationConfig, ScannerConfig, AILearningConfig)
 
 server.py                   → FastAPI REST API wrapping ScalpingBot
 dashboard/                   → Next.js frontend (proxies to :8000)
@@ -44,7 +61,7 @@ dashboard/                   → Next.js frontend (proxies to :8000)
 ### Core Trading (root)
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.py` | ~820 | Bot orchestrator, CLI entry, trading loop (`ScalpingBot`), re-entry integration, funding rate/OI fetching, correlation matrix updates, periodic pair scanning |
+| `main.py` | ~860 | Bot orchestrator, CLI entry, trading loop (`ScalpingBot`), re-entry integration, funding rate/OI fetching, correlation matrix updates, periodic pair scanning, AI advisor pre-trade consultation + post-trade feedback |
 | `config.py` | ~520 | All config dataclasses: `BotConfig`, `FuturesConfig`, `TradingConfig`, `RiskConfig`, `DailyTargetConfig`, `CandleConfig` (incl. MACD + squeeze), `VolumeConfig`, `ExitConfig`, `ReentryConfig`, `CorrelationConfig`, `ScannerConfig` |
 | `candle_analyzer.py` | ~1400 | Multi-TF swing signals. `CandleAnalyzer` → `SwingSignal` (EMA crossover, RSI, ATR TP/SL, ADX filter, MACD momentum, BB squeeze + Keltner Channel, daily trend gate, 15m entry timing, pattern + divergence + volume/funding/OI integration, S/R levels) |
 | `candle_patterns.py` | ~350 | Candlestick pattern recognition. `PatternDetector` → `PatternScanResult`. Detects: engulfing, pin bar (hammer/shooting star), doji, morning/evening star, three soldiers/crows, marubozu. `evaluate_patterns_for_signal()` for confidence adjustments |
@@ -58,7 +75,7 @@ dashboard/                   → Next.js frontend (proxies to :8000)
 | `position_sizer.py` | ~310 | Kelly Criterion + confidence + drawdown + intraday DD + target-aware leverage (5x-20x interpolated). Key class: `PositionSizer`, `SizingResult` |
 | `risk_manager.py` | ~270 | Global risk controls: daily loss limit, drawdown halt (25%), cooldown. Key class: `RiskManager`, `TradeRecord` |
 | `correlation.py` | ~500 | Cross-pair correlation guard + portfolio exposure. `CorrelationMatrix` (rolling 30-day Pearson on log returns), `CorrelationGuard` (block/reduce correlated same-direction), `PortfolioHeatMap` (directional exposure limits) |
-| `shadow_trader.py` | ~900 | Paper trading sim with partial TP scale-out, Chandelier Exit, dynamic SL, correlation size mult. `ShadowTrader`, `ShadowTrade` (80+ fields incl. volume/funding/OI), `TPLevel` |
+| `shadow_trader.py` | ~900 | Paper trading sim with partial TP scale-out, Chandelier Exit, dynamic SL, correlation size mult. `ShadowTrader`, `ShadowTrade` (80+ fields incl. volume/funding/OI/advisor), `TPLevel` |
 | `reentry.py` | ~170 | Smart re-entry after stop-outs. `ReentryManager`, `ReentryCandidate`. Checks trend validity, ADX, confidence, daily loss limit |
 | `order_manager.py` | ~530 | Live order execution. `OrderManager`, `ManagedOrder`, `Position` |
 | `websocket_client.py` | ~230 | ccxt.pro WebSocket streaming. `OrderBookStream` |
@@ -81,6 +98,50 @@ dashboard/                   → Next.js frontend (proxies to :8000)
 | `pair_performance.py` | ~215 | `PairPerformanceTracker` (per-pair win rate, P&L, profit factor, contribution %), `PairStats` (auto-disable <35% WR, auto-include >60% WR). Real-time `record_trade()` + batch `update_from_trades()` |
 | `__init__.py` | Re-exports: `OpportunityScanner`, `PairScore`, `PairSelector`, `ScanResult`, `PairPerformanceTracker` |
 
+### Backtester Module (`backtester/`)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `data_manager.py` | ~290 | `DataManager` — download historical klines from Binance API, store in SQLite (`historical_candles` table), incremental sync, date range retrieval, multi-timeframe candle dict builder for `CandleAnalyzer` |
+| `engine.py` | ~520 | `BacktestEngine` — event-driven candle replay, runs full signal pipeline (CandleAnalyzer + entry gates + PositionSizer + RiskManager + DailyTarget), simulates partial TP/Chandelier/dynamic SL, realistic slippage (0.02% BTC, 0.05% alts), param sweep support |
+| `metrics.py` | ~310 | `PerformanceMetrics` (30+ fields), `compute_metrics()` — win rate, profit factor, Sharpe/Sortino/Calmar ratios, max drawdown (% + duration), recovery factor, streaks, fee impact, per-category breakdowns (symbol/direction/regime/session/exit), monthly returns |
+| `optimizer.py` | ~280 | `WalkForwardOptimizer` — in-sample (70%) / out-of-sample (30%) split, single-param and grid optimization, overfit detection (>30% OOS degradation), scoring via Sharpe-weighted profit factor |
+| `report.py` | ~290 | `generate_report()` — HTML report with Chart.js equity curve, drawdown chart, monthly returns bar chart, all metrics, breakdown tables, best/worst trades. Dark theme, responsive |
+| `__main__.py` | ~310 | CLI: `sync-data`, `run`, `optimize`, `report`, `status`, `list-params` commands. Auto-saves results for later report generation |
+
+### AI Learning Module (`ai_learning/`)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `knowledge_base.py` | ~340 | `KnowledgeBase` — SQLite storage for knowledge entries, vector embeddings (sentence-transformers), semantic search (cosine similarity), keyword fallback search, deduplication, ingestion logging, application stats tracking |
+| `youtube_ingestor.py` | ~290 | `YouTubeIngestor` — fetch video metadata (yt-dlp), extract transcripts (youtube-transcript-api, prefer manual captions), clean filler words/timestamps, chunk into ~500-word overlapping segments, clickbait detection, age filtering |
+| `paper_ingestor.py` | ~280 | `PaperIngestor` — extract text from web pages (trafilatura), PDFs (pdfplumber), arXiv papers (API + XML parsing), chunk into ~500-word segments. Handles URL detection, PDF download, metadata extraction |
+| `knowledge_extractor.py` | ~280 | `KnowledgeExtractor` — LLM-based structured knowledge extraction (Claude/OpenAI), 7-category extraction (strategies/indicators/risk_rules/insights/patterns/exits/mistakes), confidence filtering, deduplication against KB, rate limiting with exponential backoff |
+| `advisor.py` | ~480 | `TradingAdvisor` — pre-trade knowledge consultation (queries KB for strategies/risks/mistakes, LLM synthesis), post-trade feedback loop (updates KB entry success rates, deprecation/boosting). `AdvisorResult`, `ConsultationRecord`. 100 calls/day budget, 15-min cache TTL, quantized cache keys |
+| `__init__.py` | ~30 | Re-exports: `KnowledgeBase`, `KnowledgeEntry`, `SearchResult`, `KnowledgeExtractor`, `YouTubeIngestor`, `PaperIngestor`, `TradingAdvisor`, `AdvisorResult`, `ConsultationRecord` |
+| `__main__.py` | ~270 | CLI: `ingest-youtube`, `ingest-paper`, `sync-sources`, `search`, `stats` commands. Orchestrates ingestion pipeline |
+
+### Dashboard (`dashboard/`)
+| File | Purpose |
+|------|---------|
+| `src/app/page.tsx` | Main dashboard with tabbed layout: Overview, Signals, Trades, Analytics, Risk, AI Learning |
+| `src/app/globals.css` | TailwindCSS theme, custom animations (shimmer, fade-in, signal-enter, pulse-dot, glow-gold, tab-active-bar) |
+| `src/lib/api.ts` | API URL helper, fetchAPI wrapper |
+| `src/lib/hooks.ts` | SWR hooks (20 total): useStatus, useTrades, usePositions, usePerformance, usePnlChart, useSignals, usePrices, useDailyTarget, useDailyTargetHistory, useDailyTargetProjection, useRegime, useWinrateAnalytics, useRiskAnalytics, useAdvancedPerformance, useCorrelation, useExposure, useDailyEquity, useLearning, useAdvisorStats, useAdvisorKBPerformance |
+| `src/components/DailyTargetHero.tsx` | Circular SVG gauge (color transitions), trading mode badge, 30-day calendar heatmap, UTC day progress bar, compound projection panel |
+| `src/components/MarketRegimePanel.tsx` | Per-pair regime display: regime badge (STRONG_TREND/TREND/WEAK/RANGING/SQUEEZE), ADX bar, RSI, session, eligibility, squeeze indicators |
+| `src/components/SignalAnalytics.tsx` | Win rate breakdowns (7 dimensions: confidence/symbol/direction/regime/session/DOW/exit reason), Recharts bar charts, breakdown tables |
+| `src/components/LiveSignalMonitor.tsx` | Real-time signal feed with status cards (taken/filtered/low_conf), confidence, ADX, price, legend |
+| `src/components/TradeJournal.tsx` | Expandable trade cards (18 indicator fields), partial TP timeline, AI advisor reasoning panel, notes with save, filters (symbol/side/outcome), CSV export |
+| `src/components/RiskDashboard.tsx` | Drawdown gauge (0-25%), daily P&L bar (bidirectional), sizer state, position details, correlation matrix, portfolio exposure |
+| `src/components/PerformanceComparison.tsx` | Sharpe/Sortino/max DD stats, rolling win rate gauges (7/30 trade), cumulative P&L chart (gross vs net with fee impact) |
+| `src/components/AILearning.tsx` | AI Learning & Advisor dashboard: KB stats, consultation history, KB entry performance ranking, ingestion log |
+| `src/components/StatusBar.tsx` | Top bar: bot status, equity, daily P&L |
+| `src/components/EquityCard.tsx` | Equity display card |
+| `src/components/PnlChart.tsx` | Cumulative P&L line chart |
+| `src/components/PositionsPanel.tsx` | Open positions with live unrealized P&L |
+| `src/components/TradeHistory.tsx` | Basic trade history list |
+| `src/components/SignalGauges.tsx` | Signal confidence gauges |
+| `src/components/PerformanceStats.tsx` | Win rate, profit factor, trade count stats |
+
 ### Tests (`tests/`)
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -99,6 +160,7 @@ dashboard/                   → Next.js frontend (proxies to :8000)
 | `test_correlation.py` | 56 | CorrelationMatrix (price updates, log returns, Pearson, serialization, staleness, edge cases), CorrelationGuard (high/medium/low corr, natural hedge, strong signal exception, disabled, multiple positions, boundary values), PortfolioHeatMap (exposure computation, directional bias, breach detection, size capping, summary), integration (full pipeline, 5-pair matrix) |
 | `test_scanner.py` | 63 | ADX/ATR/BB squeeze computation (9), scoring normalization (7), PairSelector (filters, top-N, anchor dedup, open-position retention, disabled/auto-include, added/dropped, needs_scan) (18), ScanResult (dedup, ordering) (3), PairPerformanceTracker (record_trade, win rate, auto-disable/include, update_from_trades, profit_factor, lookback, summary, recovery) (15), edge cases (8), config (3) |
 | `test_adx.py` | 11 | ADX calculation, integration with SwingSignal |
+| `test_ai_learning.py` | 121 | KnowledgeBase CRUD (8), keyword search (4), ingestion log (3), stats (2), deduplication (3), embedding serialization (2), extraction parsing (4), entry conversion (4), confidence filtering (1), dedup logic (1), YouTube video ID extraction (7), transcript cleaning (5), chunking (6), clickbait/age filters (5), paper text cleaning (4), paper chunking (2), arXiv XML parsing (3), end-to-end pipeline (3), category map (2), AdvisorResult (3), ConsultationRecord (2), cache key (6), apply_advice (11), feedback loop (7), KB review (3), advisor stats (6), budget/cache (6), consult edge cases (3), response parsing (5) |
 
 ## Confidence Scoring Pipeline
 ```
@@ -180,8 +242,9 @@ Before a trade is executed, it must pass through these gates in order:
 17. Smart re-entry check (if stopped out recently, trend still valid)
 18. Correlation guard (>0.80 block, 0.60-0.80 reduce 50%, natural hedge allow, strong signal exception)
 19. Portfolio exposure check (net long/short ≤ 20× capital, reduce or block if breached)
-20. Risk manager `can_trade()` + daily target mode check
-21. Position limit + confidence threshold per mode
+20. AI Advisor consultation (KB query + LLM synthesis → SKIP honored if conf < 0.70, confidence ±0.10 adjustment)
+21. Risk manager `can_trade()` + daily target mode check
+22. Position limit + confidence threshold per mode
 
 ## Partial Take Profit (Scale-Out)
 ```
@@ -485,12 +548,27 @@ notional     = position_usd × leverage
 | `/api/scanner` | GET | Scanner results: pair scores, selections, active/dropped pairs |
 | `/api/scanner/performance` | GET | Per-pair win rate, P&L, profit factor, disabled/auto-include flags |
 | `/api/scanner/scan` | POST | Trigger on-demand pair scan |
+| `/api/daily-target/history` | GET | Calendar heatmap data (daily target hit/miss, P&L per day) |
+| `/api/daily-target/projection` | GET | Compound projection (7d/30d/90d projected equity) |
+| `/api/regime` | GET | Per-pair regime with ADX, RSI, session, eligibility, block reasons |
+| `/api/signals/stream` | GET | SSE endpoint for live signal streaming |
+| `/api/analytics/winrate` | GET | Multi-dimensional win rate breakdowns (confidence/symbol/direction/regime/session/DOW/exit) |
+| `/api/analytics/risk` | GET | Drawdown, sizer state, position sizing details, daily P&L, halt status |
+| `/api/analytics/performance` | GET | Sharpe, Sortino, max drawdown, rolling win rates, cumulative gross vs net P&L |
+| `/api/trades/{id}` | GET | Detailed single trade with all indicator fields |
+| `/api/trades/{id}/notes` | POST | Save manual trade annotation/notes |
+| `/api/learning/recent` | GET | Recent knowledge entries, ingestion history, KB stats |
+| `/api/learning/stats` | GET | Knowledge base statistics (categories, source types, top applied) |
+| `/api/learning/search` | GET | Semantic search over knowledge base (query: q, top_k, category) |
+| `/api/advisor/stats` | GET | Advisor stats: total consultations, agreement rate, cache, recent consultations |
+| `/api/advisor/consultation/{trade_id}` | GET | Advisor consultation record for specific trade |
+| `/api/advisor/kb-performance` | GET | KB entries ranked by application count with success/failure status |
 | `/api/bot/start` | POST | Start the bot |
 | `/api/bot/stop` | POST | Stop the bot |
 | `/health` | GET | Health check |
 
 ## Database Schema (SQLite, WAL mode)
-- **trades**: trade_id, symbol, side, entry/exit price, pnl_usd, pnl_pct, exit_reason, leverage, kelly_pct, drawdown_mult, regime, session, post_fee_rr, adx, is_open, tp1_hit/price/pnl, tp2_hit/price/pnl, tp3_hit/price/pnl, original_amount, atr_at_entry, partial_realized_pnl, partial_fees, max_favorable_price, is_reentry, reentry_count, obv_trend, obv_divergence, volume_pressure, buy_volume_ratio, poc_price, funding_rate, funding_extreme, oi_change_pct, oi_conviction
+- **trades**: trade_id, symbol, side, entry/exit price, pnl_usd, pnl_pct, exit_reason, leverage, kelly_pct, drawdown_mult, regime, session, post_fee_rr, adx, is_open, tp1_hit/price/pnl, tp2_hit/price/pnl, tp3_hit/price/pnl, original_amount, atr_at_entry, partial_realized_pnl, partial_fees, max_favorable_price, is_reentry, reentry_count, obv_trend, obv_divergence, volume_pressure, buy_volume_ratio, poc_price, funding_rate, funding_extreme, oi_change_pct, oi_conviction, advisor_recommendation, advisor_confidence_adj, advisor_reasoning, advisor_source_ids
 - **signals**: timestamp, symbol, mid_price, composite_score, swing_trend/confidence, vpin, regime, session, adx, obv_trend, obv_divergence, volume_pressure, buy_volume_ratio, funding_rate, funding_extreme, oi_change_pct, oi_conviction
 - **daily_equity**: date, open/close_equity, target_pct, actual_pct, target_hit, realized_pnl, wins, losses, streak, miss_streak, mode_at_close
 - **bot_state**: key-value store (JSON values)
@@ -515,13 +593,14 @@ notional     = position_usd × leverage
 17. **Smart re-entry** → check if recently stopped-out signal is still valid → re-enter with 70% size
 18. **Correlation guard** → check cross-pair correlation with open positions → block/reduce/allow
 19. **Portfolio exposure** → check net directional exposure vs 20× capital limit → reduce/block
-20. **Risk check** → `can_trade()` → daily loss, drawdown, cooldown, trade count
-21. **Daily target check** → mode gating (confidence threshold, position limit, halt)
-22. **Position sizing** → Kelly × multiplier chain × correlation_size_mult → `SizingResult` with margin + leverage
-23. **Entry** → shadow: `ShadowTrade` with partial TP levels | live: limit order via ccxt
-24. **Monitoring** → partial TP scale-out, Chandelier trailing, dynamic SL, VPIN widening, max hold
-25. **Exit** → close trade (partial PnL + remaining), record to risk manager + daily target + database + pair performance
-26. **Daily reset** (UTC 00:00) → compound equity, update streaks, auto-reduce target if needed
+20. **AI Advisor** → query KB for strategies/risks/mistakes, LLM synthesis → SKIP (if conf<0.70) or adjust confidence (±0.10)
+21. **Risk check** → `can_trade()` → daily loss, drawdown, cooldown, trade count
+22. **Daily target check** → mode gating (confidence threshold, position limit, halt)
+23. **Position sizing** → Kelly × multiplier chain × correlation_size_mult → `SizingResult` with margin + leverage
+24. **Entry** → shadow: `ShadowTrade` with partial TP levels | live: limit order via ccxt
+25. **Monitoring** → partial TP scale-out, Chandelier trailing, dynamic SL, VPIN widening, max hold
+26. **Exit** → close trade (partial PnL + remaining), record to risk manager + daily target + database + pair performance + **AI advisor feedback** (update KB entry stats)
+27. **Daily reset** (UTC 00:00) → compound equity, update streaks, auto-reduce target if needed
 
 ## Key Design Decisions
 - **Asymmetric loss limit**: Can gain 2% but max loss is only 1% (50% of target)
@@ -574,9 +653,84 @@ notional     = position_usd × leverage
 - **Auto-disable threshold at 35% WR**: With partial TP (TP1 at 1×ATR), even a 35% WR pair likely covers fees — below that, the pair is consistently losing money
 - **Auto-include requires scanner appearance**: A high-WR pair must also appear in the scanner scan to be auto-included — prevents including illiquid or flat pairs just because they had a lucky streak
 - **Profit factor tracked in real-time**: `record_trade()` maintains running gross profit/loss sums — avoids expensive DB queries on every trade close while keeping dashboard current
+- **Advisor SKIP override at 0.70**: Strong quantitative signals (confidence ≥ 0.70) override advisor SKIP recommendations — prevents the advisory system from blocking high-conviction setups that pass all other gates
+- **Advisor as soft filter, not hard gate**: Advisor can adjust confidence ±0.10 and suggest SKIP, but never hard-blocks a trade on its own — the quantitative pipeline remains authoritative
+- **Advisor cache key quantization**: Continuous values (confidence→0.1, ADX→5-unit, RSI→10-unit buckets) create a reasonable cache key space — similar market conditions get the same advice without excessive LLM calls
+- **100 calls/day budget**: Limits LLM costs while providing ~4 consultations/hour during active trading — cache hits extend effective coverage significantly
+- **KB entry deprecation/boosting**: Entries with <30% success after 10+ uses are flagged, >65% boosted — creates a feedback loop that naturally improves knowledge quality over time
+- **Advisor graceful degradation**: If KB is empty, LLM unavailable, or budget exhausted → returns PROCEED with no adjustment — never prevents trading due to advisory system failure
+
+## AI Learning Pipeline (`ai_learning/`)
+```
+Ingestion Flow:
+  YouTube URL / Channel ID → yt-dlp metadata → youtube-transcript-api transcript
+    → clean (filler words, timestamps) → chunk (~500 words, 50 overlap)
+    → LLM extraction (Claude/OpenAI) → confidence filter (≥0.5)
+    → dedup (cosine similarity ≥0.85) → store in KB
+
+  Paper/Blog URL → trafilatura (web) or pdfplumber (PDF)
+    → clean → chunk → LLM extraction → filter → dedup → store
+
+  arXiv → API query → parse XML → extract abstracts/PDFs → same pipeline
+
+Knowledge Categories (7):
+  strategy, indicator, risk_rule, insight, pattern, exit, mistake
+
+Storage:
+  SQLite (ai_knowledge.db, WAL mode)
+  - knowledge_entries: id, source_type, source_url, source_title, category,
+    content (JSON), confidence, extraction_date, times_applied, success_rate,
+    embedding (BLOB — numpy float32), chunk_hash
+  - ingestion_log: source tracking, timestamps, chunk/entry counts, status
+
+Search:
+  Semantic: sentence-transformers (all-MiniLM-L6-v2, 384-dim) → cosine similarity
+  Fallback: keyword matching when embeddings unavailable
+
+Dependencies: yt-dlp, youtube-transcript-api, trafilatura, pdfplumber,
+              sentence-transformers, anthropic (or openai)
+```
+
+## AI Advisor (`ai_learning/advisor.py`)
+```
+Pre-trade Consultation:
+  1. Query KB: strategies (3), risk_rules (3), mistakes (3), patterns (2) — category-filtered
+  2. If no relevant entries found → skip LLM, return PROCEED
+  3. Build context: symbol, side, confidence, regime, ADX, RSI, patterns, squeeze, funding, OI
+  4. LLM synthesis (Claude/OpenAI, <500 tokens) → {recommendation, confidence_adjustment, reasoning, suggested_adjustments}
+  5. Cache result (15-min TTL, quantized key: symbol|side|regime|conf_0.1|adx_5|rsi_10)
+
+Integration Rules:
+  SKIP + confidence < 0.70 → honor skip (trade blocked)
+  SKIP + confidence ≥ 0.70 → log disagreement, proceed anyway (strong signal overrides)
+  CAUTION / PROCEED → apply confidence adjustment (±0.10 max), proceed
+
+Post-trade Feedback Loop:
+  1. On trade close → update KB entry stats (times_applied++, success_rate recalculated)
+  2. Review entries with ≥10 applications:
+     - success_rate < 30% → flagged for deprecation (logged warning)
+     - success_rate > 65% → boosted (logged info)
+  3. Consultation record updated with trade outcome (win/loss) and P&L
+
+Rate Limiting:
+  - 100 LLM calls/day budget (UTC midnight reset)
+  - 15-minute cache TTL reduces redundant calls
+  - Graceful fallback: if LLM unavailable → PROCEED (no blocking)
+
+Dashboard Integration:
+  - Trade Journal: advisor recommendation badge, confidence adjustment, reasoning text
+  - AI Learning tab: consultation stats, agreement rate, KB entry performance ranking
+```
+
+## AI Advisor API Endpoints
+| Route | Method | Returns |
+|-------|--------|---------|
+| `/api/advisor/stats` | GET | Total consultations, calls today, agreement rate, cache size, recent consultations |
+| `/api/advisor/consultation/{trade_id}` | GET | Advisor consultation record for a specific trade |
+| `/api/advisor/kb-performance` | GET | KB entries ranked by application count with success/failure status |
 
 ## Environment
 - Python 3.10+, ccxt.pro, numpy, fastapi, uvicorn
-- `.env` for API keys: `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_TESTNET`
-- SQLite database: `bot_data.db` (WAL mode)
+- `.env` for API keys: `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_TESTNET`, `ANTHROPIC_API_KEY`
+- SQLite databases: `bot_data.db` (WAL mode), `ai_knowledge.db` (WAL mode)
 - Shadow trade logs: `shadow_trades.jsonl`, `shadow_trades_signals.jsonl`

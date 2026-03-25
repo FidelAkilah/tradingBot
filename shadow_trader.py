@@ -124,6 +124,11 @@ class ShadowTrade:
     # ── Re-entry tracking ──
     is_reentry: bool = False
     reentry_count: int = 0
+    # ── Advisor ──
+    advisor_recommendation: str = ""       # PROCEED / SKIP / CAUTION / "" (not consulted)
+    advisor_confidence_adj: float = 0.0    # Confidence adjustment applied
+    advisor_reasoning: str = ""            # Brief explanation
+    advisor_source_ids: str = ""           # JSON list of KB entry IDs
     # ── Volume/Funding/OI ──
     obv_trend: str = "neutral"
     obv_divergence: bool = False

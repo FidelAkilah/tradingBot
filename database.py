@@ -163,6 +163,13 @@ def init_db():
         "oi_change_pct": "REAL",
         "oi_conviction": "TEXT",
     })
+    _migrate_add_columns(conn, "trades", {
+        # Advisor columns
+        "advisor_recommendation": "TEXT",
+        "advisor_confidence_adj": "REAL",
+        "advisor_reasoning": "TEXT",
+        "advisor_source_ids": "TEXT",
+    })
     _migrate_add_columns(conn, "signals", {
         "adx": "REAL",
         "post_fee_rr": "REAL",

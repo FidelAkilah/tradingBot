@@ -20,9 +20,15 @@ body {
 ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
 
-/* Glow effect for profit */
+/* Glow effects */
 .glow-green { text-shadow: 0 0 10px rgba(16, 185, 129, 0.5); }
 .glow-red { text-shadow: 0 0 10px rgba(239, 68, 68, 0.5); }
+.glow-gold { text-shadow: 0 0 15px rgba(251, 191, 36, 0.6), 0 0 30px rgba(251, 191, 36, 0.3); }
+
+/* Ring glow for gold bonus */
+.ring-glow-gold {
+  box-shadow: 0 0 15px rgba(251, 191, 36, 0.4), 0 0 30px rgba(251, 191, 36, 0.2);
+}
 
 /* Pulse animation for live indicator */
 @keyframes pulse-dot {
@@ -34,4 +40,43 @@ body {
 /* Gauge fill animation */
 @keyframes gauge-fill {
   from { stroke-dashoffset: 283; }
+}
+
+/* Shimmer loading animation */
+@keyframes shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.04) 50%, transparent 100%);
+  background-size: 200px 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Tab active indicator slide */
+@keyframes tab-slide {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+.tab-active-bar {
+  animation: tab-slide 0.2s ease-out forwards;
+  transform-origin: left;
+}
+
+/* Fade in for panel transitions */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* Signal feed scroll */
+@keyframes signal-enter {
+  from { opacity: 0; transform: translateX(-10px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.signal-enter {
+  animation: signal-enter 0.3s ease-out;
 }

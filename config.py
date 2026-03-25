@@ -508,6 +508,48 @@ class DailyTargetConfig:
 
 
 @dataclass
+class AILearningConfig:
+    """Configuration for the AI knowledge ingestion pipeline."""
+    enabled: bool = True
+    db_path: str = ""  # Empty = use default (ai_knowledge.db alongside bot_data.db)
+
+    # YouTube ingestion
+    youtube_channels: list = field(default_factory=lambda: [
+        # Curated crypto swing trading / TA education channels (IDs)
+    ])
+    youtube_max_age_days: int = 180          # Ignore videos older than 6 months
+    youtube_clickbait_patterns: list = field(default_factory=lambda: [
+        r"(?i)\b(100|1000)x\b", r"(?i)guaranteed", r"(?i)get rich",
+        r"(?i)millionaire overnight", r"(?i)free money",
+    ])
+    youtube_chunk_words: int = 500           # Words per transcript chunk
+    youtube_chunk_overlap: int = 50          # Overlap between chunks
+    youtube_weekly_check: bool = True        # Auto-check channels weekly
+
+    # Paper / blog ingestion
+    monitored_urls: list = field(default_factory=list)   # Blog/substack URLs to monitor
+    arxiv_query: str = "cryptocurrency trading"          # arXiv search query
+    arxiv_max_results: int = 10                          # Papers per sync
+    paper_chunk_words: int = 500
+    paper_chunk_overlap: int = 50
+
+    # Knowledge extraction (LLM)
+    llm_provider: str = "anthropic"          # "anthropic" or "openai"
+    llm_model: str = "claude-sonnet-4-5-20250514"  # Model for extraction
+    min_confidence: float = 0.5              # Discard extractions below this
+    dedup_similarity_threshold: float = 0.85 # Cosine sim threshold for dedup
+
+    # Embedding
+    embedding_model: str = "all-MiniLM-L6-v2"  # sentence-transformers model
+    embedding_dim: int = 384                     # Dimension for all-MiniLM-L6-v2
+
+    # Rate limits
+    llm_requests_per_minute: int = 30
+    llm_retry_max: int = 3
+    llm_retry_delay: float = 2.0               # Base delay for exponential backoff
+
+
+@dataclass
 class BotConfig:
     """Master configuration aggregator."""
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
@@ -525,6 +567,7 @@ class BotConfig:
     reentry: ReentryConfig = field(default_factory=ReentryConfig)
     correlation: CorrelationConfig = field(default_factory=CorrelationConfig)
     scanner: ScannerConfig = field(default_factory=ScannerConfig)
+    ai_learning: AILearningConfig = field(default_factory=AILearningConfig)
     log_level: str = "INFO"
 
 

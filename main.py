@@ -30,6 +30,13 @@ from shadow_trader import ShadowTrader
 from vpin_analyzer import FlowRegime
 from websocket_client import OrderBookStream
 
+# AI Learning (optional — gracefully degrade if unavailable)
+try:
+    from ai_learning import KnowledgeBase, TradingAdvisor
+    _AI_LEARNING_AVAILABLE = True
+except ImportError:
+    _AI_LEARNING_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # LOGGING SETUP
 # ─────────────────────────────────────────────
@@ -162,6 +169,16 @@ class ScalpingBot:
         self.scanner = OpportunityScanner(config)
         self.pair_selector = PairSelector(config)
         self.pair_performance = PairPerformanceTracker(config)
+
+        # AI Learning advisor (optional)
+        self.advisor: Optional['TradingAdvisor'] = None
+        if _AI_LEARNING_AVAILABLE:
+            try:
+                kb = KnowledgeBase(config.ai_learning)
+                self.advisor = TradingAdvisor(config.ai_learning, kb)
+                logger.info("  AI Learning advisor initialized")
+            except Exception as e:
+                logger.warning(f"  AI Learning advisor unavailable: {e}")
 
         # Swing signal cache (updated every 60s, not every OB tick)
         self._swing_cache: dict = {}  # symbol -> SwingSignal
@@ -559,6 +576,23 @@ class ScalpingBot:
                 self.daily_target.record_trade(trade_record.pnl_usd)
                 self.pair_performance.record_trade(symbol, trade_record.pnl_usd)
 
+                # AI Advisor post-trade feedback
+                if self.advisor:
+                    st = self.shadow.closed_trades[-1] if self.shadow.closed_trades else None
+                    if st and st.advisor_source_ids:
+                        try:
+                            import json as _json
+                            source_ids = _json.loads(st.advisor_source_ids)
+                            was_followed = st.advisor_recommendation != "SKIP"
+                            self.advisor.record_trade_outcome(
+                                trade_id=st.trade_id,
+                                source_ids=source_ids,
+                                pnl_usd=trade_record.pnl_usd,
+                                was_followed=was_followed,
+                            )
+                        except Exception as e:
+                            logger.debug(f"[{symbol}] Advisor feedback error: {e}")
+
                 # Register stop-outs for potential re-entry
                 if trade_record.reason == "stop_loss":
                     st = self.shadow.closed_trades[-1] if self.shadow.closed_trades else None
@@ -727,10 +761,52 @@ class ScalpingBot:
                             return
                         corr_mult = min(corr_mult, exp_frac)
 
+                    # ── AI Advisor consultation ──
+                    advisor_result = None
+                    if self.advisor and swing and swing.suggested_side:
+                        try:
+                            advisor_result = await self.advisor.consult(
+                                symbol=symbol,
+                                side=swing.suggested_side,
+                                confidence=swing.confidence,
+                                regime=swing.regime,
+                                adx=max(swing.adx_1h, swing.adx_4h),
+                                rsi_1h=swing.rsi_1h,
+                                rsi_4h=swing.rsi_4h,
+                                patterns_confirming=swing.pattern_confirming,
+                                patterns_contradicting=swing.pattern_contradicting,
+                                squeeze_releasing=swing.squeeze_releasing,
+                                funding_extreme=swing.funding_extreme,
+                                oi_conviction=swing.oi_conviction,
+                            )
+                            should_proceed, adj_conf, reason = self.advisor.apply_advice(
+                                advisor_result, swing.confidence,
+                            )
+                            if not should_proceed:
+                                logger.info(f"[{symbol}] Advisor SKIP honored: {reason}")
+                                return
+                            # Apply confidence adjustment from advisor
+                            swing.confidence = max(0.0, min(1.0, adj_conf))
+                        except Exception as e:
+                            logger.warning(f"[{symbol}] Advisor error (proceeding): {e}")
+
                     # Build daily target context for position sizer
                     self.shadow.daily_target_ctx = self.daily_target.get_sizing_context()
                     self.shadow.correlation_size_mult = corr_mult
-                    self.shadow.process_signal(analysis)
+                    trade = self.shadow.process_signal(analysis)
+
+                    # Attach advisor data to opened trade
+                    if trade and advisor_result:
+                        import json as _json
+                        trade.advisor_recommendation = advisor_result.recommendation
+                        trade.advisor_confidence_adj = advisor_result.confidence_adjustment
+                        trade.advisor_reasoning = advisor_result.reasoning
+                        trade.advisor_source_ids = _json.dumps(advisor_result.source_ids)
+                        # Link consultation record to trade
+                        for rec in reversed(self.advisor._recent_consultations):
+                            if rec.symbol == symbol and rec.trade_id is None:
+                                rec.trade_id = trade.trade_id
+                                break
 
         # ── Live Mode ──
         else:
